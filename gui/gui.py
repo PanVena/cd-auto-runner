@@ -18,11 +18,11 @@ import subprocess
 import sys
 
 from PySide6.QtCore import QObject, QProcess, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPalette, QPixmap
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSplitter, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QSplitter, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 APP = "cd-auto-runner"
@@ -254,7 +254,9 @@ class MainWindow(QMainWindow):
         self.request_info.connect(self.worker.load)
         self.thread.start()
 
-        self.timer = QTimer(self, interval=2000, timeout=self.poll)
+        self.timer = QTimer(self)
+        self.timer.setInterval(2000)
+        self.timer.timeout.connect(self.poll)
         self.timer.start()
         self.show_empty()
         QTimer.singleShot(0, self.poll)     # перший опит — коли вікно вже на екрані
@@ -430,12 +432,14 @@ class MainWindow(QMainWindow):
 
     def build_statusbar(self):
         sb = self.statusBar()
+        self.svc_icon = QLabel()
         self.svc_label = QLabel()
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(260)
         self.progress.setTextVisible(True)
         self.progress.hide()
         self.prog_label = QLabel()
+        sb.addWidget(self.svc_icon)
         sb.addWidget(self.svc_label)
         sb.addWidget(QLabel("   "))
         sb.addWidget(self.prog_label, 1)
@@ -545,7 +549,8 @@ class MainWindow(QMainWindow):
             text, icon = _("Служба працює"), "emblem-ok-symbolic"
         else:
             text, icon = _("Служба зупинена"), "media-playback-pause"
-        self.svc_label.setText(f"  {text}")
+        self.svc_icon.setPixmap(QIcon.fromTheme(icon).pixmap(16, 16))
+        self.svc_label.setText(text)
         self.svc_label.setToolTip(f"{APP}.service: {active or '—'}")
 
     # --- дії ------------------------------------------------------------------------------

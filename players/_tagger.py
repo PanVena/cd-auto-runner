@@ -16,7 +16,6 @@ import os
 import re
 import sys
 
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
@@ -175,7 +174,8 @@ class Tagger(QDialog):
         buttons.accepted.connect(self.save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        QShortcut(QKeySequence.Save, self, activated=self.save)
+        save_shortcut = QShortcut(QKeySequence.Save, self)
+        save_shortcut.activated.connect(self.save)
 
         self.resize(720, min(220 + 32 * count, 760))
         self.album.setFocus()
