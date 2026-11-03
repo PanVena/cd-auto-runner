@@ -7,11 +7,12 @@ Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
 
 ## Features
 
+- Has its own **built-in player**: it rips the disc first and plays each track from the window as soon as it is ripped.
 - Picks up players installed on your system (including Flatpak and Snap) and preselects your default music player.
 - Rips the disc to your Music folder while it plays (FLAC, Opus, Ogg, MP3 or WAV), with tags and cover art.
 - Gets track titles from MusicBrainz; for discs that aren't there, lets you enter them yourself.
 - Adds actions to Plasma's **Disks & Devices** menu: play, play in another player, rip, enter titles.
-- App window with the disc, its tracks and all settings (PySide6; falls back to `kdialog` or the terminal).
+- App window with the disc, its tracks, playback controls and all settings (PySide6; falls back to `kdialog` or the terminal).
 - English and Ukrainian interface.
 
 ## Installation
@@ -22,12 +23,12 @@ cd cd-auto-runner
 ./install.sh
 ```
 
-The installer asks for the language and the player, offers to install optional dependencies (`kdialog`, `notify-send`, `cd-paranoia`, `ffmpeg`, PySide6) and starts the service. Everything is installed for the current user; `sudo` is needed only for the dependencies. Run `./install.sh --help` for options.
+The installer asks for the language and the player, installs `mpv` (the engine of the built-in player), offers to install optional dependencies (`kdialog`, `notify-send`, `cd-paranoia`, `ffmpeg`, PySide6) and starts the service. Everything is installed for the current user; `sudo` is needed only for the dependencies. Run `./install.sh --help` for options.
 
 ## Usage
 
 ```text
-cd-auto-runner settings        the app window
+cd-auto-runner settings        the app window (and the built-in player)
 cd-auto-runner choose          choose a player
 cd-auto-runner play [/dev/sr0] start the player manually
 cd-auto-runner rip             rip the disc to the music library without playing
@@ -42,7 +43,7 @@ Settings are stored in `~/.config/cd-auto-runner/config`. A custom player comman
 
 ## Supported players
 
-VLC and mpv play the disc directly. Audacious, Elisa and QMPlay2 get ripped tracks: playback starts in a few seconds, and if you skip to a track that isn't ripped yet, it is ripped first. Any other player gets `cdda://`.
+The built-in player (CD Auto Runner itself) rips the tracks and plays them in its window through mpv, which runs as a separate process; double-click a track to play it, and if it isn't ripped yet, it is ripped first. VLC and mpv play the disc directly. Audacious, Elisa and QMPlay2 get ripped tracks: playback starts in a few seconds, and if you skip to a track that isn't ripped yet, it is ripped first. Any other player gets `cdda://`.
 
 To add a player, copy an adapter from `players/` to `~/.config/cd-auto-runner/players/` and edit it. Test it with `cd-auto-runner play -n -p <desktop-id>`. Pull requests are welcome.
 

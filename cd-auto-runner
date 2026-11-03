@@ -197,10 +197,11 @@ adapter_dirs() {
 # Заповнює ADAPTER_FOR[desktop-id]=файл, ADAPTER_NOTE[файл]=опис і CDAR_LIB
 load_adapters() {
   declare -gA ADAPTER_FOR=() ADAPTER_NOTE=()
-  CDAR_LIB=""; GENERIC_ADAPTER=""; RIP_ADAPTER=""; TAG_ADAPTER=""
+  CDAR_LIB=""; GENERIC_ADAPTER=""; RIP_ADAPTER=""; TAG_ADAPTER=""; BUILTIN_ADAPTER=""
   local d f id ids
   while IFS= read -r d; do
     [[ -z "$CDAR_LIB" && -f "$d/_lib.sh" ]] && CDAR_LIB="$d/_lib.sh"
+    [[ -z "$BUILTIN_ADAPTER" && -f "$d/_builtin.sh" ]] && BUILTIN_ADAPTER="$d/_builtin.sh"
     [[ -z "$GENERIC_ADAPTER" && -f "$d/_generic.sh" ]] && GENERIC_ADAPTER="$d/_generic.sh"
     [[ -z "$RIP_ADAPTER" && -f "$d/_rip.sh" ]] && RIP_ADAPTER="$d/_rip.sh"
     [[ -z "$TAG_ADAPTER" && -f "$d/_tag.sh" ]] && TAG_ADAPTER="$d/_tag.sh"
@@ -244,12 +245,14 @@ mime_default() {
 }
 
 # Визначає типовий програвач: DEFAULT_ID і DEFAULT_WHY
+#   0) вбудований програвач (вікно програми + mpv), якщо його можна запустити;
 #   1) явно заданий для Audio CD (x-content/audio-cdda);
 #   2) «Програвач музики» з налаштувань KDE / системи (audio/mpeg, audio/ogg, audio/flac),
 #      але лише якщо він точно вміє Audio CD (рівень 1).
 find_default() {
   DEFAULT_ID=""; DEFAULT_WHY=""
   local t
+  if builtin_available; then DEFAULT_ID=builtin; DEFAULT_WHY="$(_ 'типовий')"; return 0; fi
   if DEFAULT_ID="$(mime_default x-content/audio-cdda)"; then DEFAULT_WHY="$(_ 'типовий для Audio CD')"; return 0; fi
   local i
   for t in audio/mpeg audio/ogg audio/flac audio/x-flac; do
@@ -321,12 +324,28 @@ list_drives() {
 
 valid_device() { [[ "$1" =~ ^/dev/[A-Za-z0-9_/.-]+$ ]]; }
 
+# Вбудований програвач: вікно програми (gui.py, PySide6) відтворює треки через mpv
+gui_path() {
+  local g
+  for g in "$(dirname "$SELF")/gui/gui.py" "$DATA_DIR/$APP/gui.py"; do
+    [[ -f "$g" ]] && { printf '%s' "$g"; return 0; }
+  done
+  return 1
+}
+has_pyside() { python3 -c 'import PySide6.QtWidgets' 2>/dev/null; }
+builtin_available() { have mpv && gui_path >/dev/null && has_pyside; }
+builtin_name() { _ 'CD Auto Runner (вбудований програвач)'; }
+
 # ---------------------------------------------------------------------------
 # Команди
 # ---------------------------------------------------------------------------
 cmd_list() {
   detect_players
+  if builtin_available; then
+    printf '%s\t%s\t%s\n' builtin "$(builtin_name) — $(_ 'копіює диск і відтворює у вікні програми') ★ $DEFAULT_WHY" _builtin.sh
+  fi
   if ((${#FOUND_IDS[@]} == 0)); then
+    builtin_available && return 0
     _ 'У системі не знайдено аудіопрогравачів. Можна вказати власну команду: %s choose' "$APP"; echo
     return 3
   fi
@@ -420,6 +439,10 @@ cmd_choose() {
   detect_players
   local i
   local ids=() names=() labels=() fps=()
+  if builtin_available; then
+    ids+=(builtin); names+=("$(builtin_name)"); fps+=("")
+    labels+=("$(builtin_name) — $(_ 'копіює диск і відтворює у вікні програми') ★ $DEFAULT_WHY")
+  fi
   for i in "${!FOUND_IDS[@]}"; do
     ids+=("${FOUND_IDS[$i]}"); names+=("${FOUND_NAMES[$i]}")
     fps+=("${FOUND_FLATPAK[$i]}"); labels+=("$(player_label "$i")")
@@ -427,7 +450,7 @@ cmd_choose() {
   ids+=("custom" "off"); names+=("$(_ 'Власна команда')" "$(_ 'вимкнено')"); fps+=("" "")
   labels+=("$(_ 'Власна команда…')" "$(_ 'Нічого не запускати (вимкнути автозапуск)')")
   # Поточний вибір: з конфігурації → типовий у системі → перший зі списку
-  local current="${PLAYER_ID:-${DEFAULT_ID:-${FOUND_IDS[0]:-}}}"
+  local current="${PLAYER_ID:-${DEFAULT_ID:-${ids[0]:-}}}"
 
   local choice=""
   if use_gui; then
@@ -466,6 +489,9 @@ cmd_choose() {
     PLAYER_ID="custom"; PLAYER_NAME="$(_ 'Власна команда')"; PLAYER_CMD="$custom"
   elif [[ "$choice" == "off" ]]; then
     PLAYER_ID="off"; PLAYER_NAME="$(_ 'вимкнено')"; PLAYER_CMD=""
+  elif [[ "$choice" == "builtin" ]]; then
+    PLAYER_ID="builtin"; PLAYER_NAME="$(builtin_name)"; PLAYER_CMD=""
+    choose_format "$(_ 'Вбудований програвач спершу копіює треки. У якому форматі зберігати їх у бібліотеці?')" || return 1
   else
     PLAYER_NAME=""
     for i in "${!ids[@]}"; do
@@ -495,10 +521,11 @@ cmd_choose() {
 }
 
 cmd_play() {
-  local dry=0 dev="" want="" rip=0
+  local dry=0 dev="" want="" rip=0 window=1
   while (($#)); do
     case "$1" in
       -n|--dry-run) dry=1 ;;
+      --no-window) window=0 ;;
       --rip) rip=1 ;;
       -p|--player) want="${2:-}"; shift ;;
       --player=*) want="${1#*=}" ;;
@@ -534,15 +561,22 @@ cmd_play() {
 
   detect_players
   local i adapter name exec fp id
-  if [[ "$want" == rip ]]; then
-    [[ -n "$RIP_ADAPTER" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено players/_rip.sh. Перевстановіть %s.' "$APP")"
-    adapter="$RIP_ADAPTER"; name="$(_ 'Бібліотека музики')"; exec="true"; fp=""; id="rip"
-  else
   if [[ -z "$want" ]]; then
     want="$DEFAULT_ID"
     [[ -n "$want" ]] || die "$(_ 'програвач ще не обрано. Запустіть: %s choose' "$APP")"
     log "$(_ 'Програвач не обрано — беру типовий: %s' "$want")"
   fi
+  if [[ "$want" == rip ]]; then
+    [[ -n "$RIP_ADAPTER" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено players/_rip.sh. Перевстановіть %s.' "$APP")"
+    adapter="$RIP_ADAPTER"; name="$(_ 'Бібліотека музики')"; exec="true"; fp=""; id="rip"
+  elif [[ "$want" == builtin ]]; then
+    [[ -n "$BUILTIN_ADAPTER" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено players/_builtin.sh. Перевстановіть %s.' "$APP")"
+    have mpv || die "$(_ 'для вбудованого програвача потрібен mpv. Встановіть його (пакет mpv) або перевстановіть %s.' "$APP")"
+    if ((window)) && ! { gui_path >/dev/null && has_pyside; }; then
+      die "$(_ 'для вбудованого програвача потрібен PySide6 (пакет python3-pyside6).')"
+    fi
+    adapter="$BUILTIN_ADAPTER"; name="$(builtin_name)"; exec="true"; fp=""; id="builtin"
+  else
   i="$(find_player "$want")" || die "$(_ 'програму %s не знайдено в системі. Запустіть: %s choose' "$want" "$APP")"
   adapter="${FOUND_ADAPTER[$i]:-$GENERIC_ADAPTER}"
   [[ -n "$adapter" && -f "$adapter" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено адаптерів (players/). Перевстановіть %s.' "$APP")"
@@ -559,6 +593,7 @@ cmd_play() {
   if ((dry)); then
     echo "# $(_ 'адаптер: %s' "$adapter")"
     env "${env[@]}" bash "$adapter"
+    [[ "$id" == builtin ]] && ((window)) && _cdar_quote_cmd "$SELF" settings --play "$dev"
     return
   fi
   # Попереднє фонове копіювання (напр. альбом докопіюється в бібліотеку після закриття
@@ -569,9 +604,26 @@ cmd_play() {
     cmd_stop >/dev/null
   fi
   log "$(_ 'Аудіо-CD у %s (треків: %s) → %s [%s]' "$dev" "$tracks" "$name" "$(basename "$adapter")")"
-  [[ "$id" == rip ]] || notify "$(_ 'Аудіо-CD')" "$(_ 'Запускаю %s…' "$name")"
+  [[ "$id" == rip || "$id" == builtin ]] || notify "$(_ 'Аудіо-CD')" "$(_ 'Запускаю %s…' "$name")"
   # Адаптер працює в окремому юніті: копіювання треків не залежить від служби
   run_detached "$APP_TITLE: $name" env "${env[@]}" bash "$adapter"
+  # Вбудований програвач: вікно відтворює треки, щойно їх скопійовано. Окремий юніт
+  # (не «-play-»): зупинка копіювання не має закривати вікно.
+  if [[ "$id" == builtin ]] && ((window)); then
+    if have systemd-run && systemctl --user show-environment >/dev/null 2>&1; then
+      systemd-run --user --quiet --collect --unit="$APP-gui-$(date +%s%N)" \
+        --description="$APP_TITLE" -- "$SELF" settings --play "$dev" && return 0
+    fi
+    setsid -f "$SELF" settings --play "$dev" >/dev/null 2>&1 < /dev/null
+  fi
+}
+
+_cdar_quote_cmd() {  # для --dry-run
+  local t out=""
+  for t in "$@"; do
+    if [[ "$t" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then out+=" $t"; else out+=" '${t//\'/\'\\\'\'}'"; fi
+  done
+  printf '%s\n' "${out# }"
 }
 
 run_detached() {  # run_detached <опис> <команда…>
@@ -611,7 +663,10 @@ cmd_solid() {
     echo "X-KDE-Priority=TopLevel"
     echo
     echo "[Desktop Action play]"
-    if [[ -n "$PLAYER_ID" && "$PLAYER_ID" != off && "$PLAYER_ID" != custom ]] && i="$(find_player "$PLAYER_ID")"; then
+    if [[ "$PLAYER_ID" == builtin ]]; then
+      echo "Name=Play in CD Auto Runner"
+      echo "Name[uk]=Відтворити в CD Auto Runner"
+    elif [[ -n "$PLAYER_ID" && "$PLAYER_ID" != off && "$PLAYER_ID" != custom ]] && i="$(find_player "$PLAYER_ID")"; then
       echo "Name=Play in ${FOUND_NAMES[$i]}"
       echo "Name[uk]=Відтворити: ${FOUND_NAMES[$i]}"
     else
@@ -673,6 +728,9 @@ cmd_set_player() {
   local id="${1:-}" i
   load_config || true
   if [[ "$id" == off ]]; then PLAYER_ID=off; PLAYER_NAME="$(_ 'вимкнено')"; PLAYER_CMD=""
+  elif [[ "$id" == builtin ]]; then
+    builtin_available || die "$(_ 'для вбудованого програвача потрібен mpv. Встановіть його (пакет mpv) або перевстановіть %s.' "$APP")"
+    PLAYER_ID=builtin; PLAYER_NAME="$(builtin_name)"; PLAYER_CMD=""
   else
     detect_players
     i="$(find_player "$id")" || die "$(_ 'програму %s не знайдено в системі. Запустіть: %s choose' "$id" "$APP")"
@@ -887,13 +945,20 @@ run_action() {
 }
 
 cmd_settings() {
-  # Повноцінне вікно (PySide6), якщо можна; інакше — меню kdialog / термінал
+  # Повноцінне вікно (PySide6), якщо можна; інакше — меню kdialog / термінал.
+  # --play [ПРИСТРІЙ] — одразу відтворювати диск у вбудованому програвачі
   local gui
-  for gui in "$(dirname "$SELF")/gui/gui.py" "$DATA_DIR/$APP/gui.py"; do
-    if [[ -f "$gui" && "${CDAR_TTY:-0}" != 1 ]] && has_display && python3 -c 'import PySide6.QtWidgets' 2>/dev/null; then
-      CDAR_UI_LANG="$CDAR_UI_LANG" CDAR_SELF="$SELF" exec python3 -I "$gui"
-    fi
+  local -a gargs=()
+  while (($#)); do
+    case "$1" in
+      --play) gargs+=(--play) ;;
+      /dev/*) valid_device "$1" && gargs+=("$1") ;;
+    esac
+    shift
   done
+  if [[ "${CDAR_TTY:-0}" != 1 ]] && has_display && gui="$(gui_path)" && has_pyside; then
+    CDAR_UI_LANG="$CDAR_UI_LANG" CDAR_SELF="$SELF" exec python3 -I "$gui" "${gargs[@]}"
+  fi
   if ! use_gui && [[ ! -t 0 && "${CDAR_TTY:-0}" != 1 ]]; then
     if have konsole && has_display; then exec konsole --hide-menubar -e "$SELF" settings --tty; fi
     die "$(_ 'немає ні kdialog, ні терміналу')"
@@ -982,7 +1047,7 @@ usage() {
 
 Використання: %s <команда> [параметри]
 
-  settings            вікно керування (усе, що нижче, без термінала)
+  settings [--play]   вікно програми: вбудований програвач і все, що нижче
   choose [--tty]      обрати програвач (kdialog або термінал)
   play [ПРИСТРІЙ]     запустити програвач для диска (за замовч. — перший аудіо-CD)
       -p, --player ID інша програма (id з «list»), напр. org.kde.elisa.desktop
@@ -1009,7 +1074,7 @@ main() {
   for a in "$@"; do [[ "$a" == "--tty" ]] && CDAR_TTY=1; done
   case "$cmd" in
     choose|--choose|-c) cmd_choose ;;
-    settings|gui)       cmd_settings ;;
+    settings|gui)       cmd_settings "$@" ;;
     set)                cmd_set "$@" ;;
     set-player)         cmd_set_player "$@" ;;
     perm)               cmd_perm "$@" ;;

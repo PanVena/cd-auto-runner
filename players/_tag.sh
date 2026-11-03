@@ -111,6 +111,7 @@ cdar_notify "$CDAR_ALBUM_ARTIST — $CDAR_ALBUM" "$(_ 'Назви збереже
 
 if ((running)); then
   if [[ "$mode" == rip || -z "$mode" ]]; then "$CDAR_SELF" rip "$CDAR_DEVICE"
+  elif [[ "$mode" == builtin ]]; then "$CDAR_SELF" play --player builtin --no-window "$CDAR_DEVICE"
   else "$CDAR_SELF" play --player "$mode" "$CDAR_DEVICE"
   fi
 fi

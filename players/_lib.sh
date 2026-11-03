@@ -692,6 +692,7 @@ _cdar_mpris_call() {
 #   CDAR_RESUME=restart  — Stop і Play: програвач заново відкриває файл. Для програвачів
 #                          з власним буфером (QMPlay2), де перемотування бере дані з буфера.
 _cdar_resume_from_start() {
+  [[ "${CDAR_MODE:-play}" == play ]] || return 0   # вбудований програвач стежить за файлами сам
   if [[ "${CDAR_RESUME:-seek}" == restart ]]; then
     _cdar_mpris_call Stop; sleep 0.5; _cdar_mpris_call Play
     cdar_log "$(_ 'трек готовий — відтворюю з початку (Stop/Play)')"
@@ -737,10 +738,14 @@ _cdar_rip_into() {
       if ! _cdar_disc_present; then _cdar_kill_tree "$p"; return 4; fi
       if _cdar_player_closed && [[ -z "${CDAR_KEEP_RIPPING:-}" ]]; then _cdar_kill_tree "$p"; return 2; fi
     fi
-    if (( n % 4 == 2 )) && [[ "$CDAR_MODE" == play ]] && ((CDAR_OPENED)); then
-      _cdar_mpris_track > "$CDAR_TMP_K" 2>/dev/null; k="$(cat "$CDAR_TMP_K")"
+    if (( n % 4 == 2 )) && ((CDAR_OPENED)) && [[ "$CDAR_MODE" == play || "$CDAR_MODE" == gui ]]; then
+      # Який трек хочуть слухати: у зовнішньому програвачі — через MPRIS,
+      # у вбудованому (вікно програми) — номер у файлі .want поруч із треками
+      if [[ "$CDAR_MODE" == play ]]; then _cdar_mpris_track > "$CDAR_TMP_K" 2>/dev/null
+      else cat -- "${CDAR_TMP_K%/*}/.want" > "$CDAR_TMP_K" 2>/dev/null || : > "$CDAR_TMP_K"; fi
+      k="$(cat "$CDAR_TMP_K")"
       if [[ -n "$k" && "$k" != "$t" && -n "${CDAR_TODO[$k]:-}" ]]; then
-        _cdar_mpris_call Pause
+        [[ "$CDAR_MODE" == play ]] && _cdar_mpris_call Pause
         cdar_log "$(_ 'у програвачі трек %s — пауза, копіюю його першим' "$k")"
         CDAR_SWITCHED=1
         _cdar_kill_tree "$p"; return 3
@@ -768,7 +773,13 @@ _cdar_fail() {
   cdar_log "$(_ 'помилка читання треку %s' "$1")"
 }
 
-# cdar_rip_and_play <функція-відкрити> [play|rip]
+# cdar_rip_and_play <функція-відкрити> [play|rip|gui]
+#
+#   play — для зовнішнього програвача (стежимо за ним через MPRIS);
+#   rip  — лише в бібліотеку музики (завжди, незалежно від налаштування LIBRARY);
+#   gui  — для вбудованого програвача: як rip, але з налаштуванням LIBRARY і
+#          без сповіщень про кожен трек (поступ видно у вікні); трек, який хочуть
+#          слухати, вікно записує у файл .want — його копіюємо першим.
 #
 # Функція-відкрити отримує ВСІ треки альбому одним списком файлів. Файли
 # створюються одразу повного розміру (WAV з тегами); програвач відкриває їх,
@@ -877,7 +888,8 @@ cdar_rip_and_play() {
   while t="$(_cdar_next_track "$cur")"; do
     cnt=$((cnt + 1))
     local msg; msg="$(_ 'Копіюю трек %s (лишилось %s з %s)…' "$t" "$((total - cnt + 1))" "$total")"
-    if [[ -n "$lib" ]]; then cdar_notify "$CDAR_ALBUM_ARTIST — $CDAR_ALBUM" "$msg"
+    if [[ "$CDAR_MODE" == gui ]]; then cdar_log "$msg"
+    elif [[ -n "$lib" ]]; then cdar_notify "$CDAR_ALBUM_ARTIST — $CDAR_ALBUM" "$msg"
     else cdar_notify "$(_ 'Аудіо-CD → %s' "$CDAR_NAME")" "$msg"; fi
     if ((!CDAR_OPENED)); then _cdar_rip_into "$t" "${wav[t]}" "${hdr[t]}" _cdar_open_all; rc=$?
     elif ((CDAR_SWITCHED)); then CDAR_SWITCHED=0; _cdar_rip_into "$t" "${wav[t]}" "${hdr[t]}" _cdar_resume_from_start; rc=$?
@@ -899,6 +911,8 @@ cdar_rip_and_play() {
   done
   _cdar_open_all
   wait 2>/dev/null
+  # Вбудований програвач: усе вже було скопійовано — не сповіщаємо про це щоразу
+  [[ "$CDAR_MODE" == gui ]] && ((total == 0 && ${#encode[@]} == 0)) && return 0
   if [[ -n "$lib" ]]; then
     cdar_notify "$CDAR_ALBUM_ARTIST — $CDAR_ALBUM" "$(_ 'Альбом скопійовано: %s' "$lib")"
     cdar_log "$(_ 'альбом у бібліотеці: %s' "$lib")"
