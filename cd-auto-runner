@@ -1,0 +1,1035 @@
+#!/usr/bin/env bash
+# cd-auto-runner — автоматично запускає обраний програвач, коли вставлено аудіо-CD.
+# Працює в KDE Plasma (і будь-якому іншому середовищі з udev + systemd).
+#
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Pan Vena
+set -uo pipefail
+
+VERSION="1.0.0"
+APP="cd-auto-runner"
+APP_TITLE="CD Auto Runner"
+ICON="media-optical-audio"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
+CONFIG_FILE="$CONFIG_DIR/config"
+SERVICE="$APP.service"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+SOLID_FILE="$DATA_DIR/solid/actions/$APP.desktop"
+
+# Переклад інтерфейсу (i18n.sh): тексти в коді — українською, _ повертає переклад.
+# Мова: CDAR_UI_LANG → UI_LANG у налаштуваннях → мова системи.
+for CDAR_I18N in "$(dirname "$SELF")/i18n.sh" "$DATA_DIR/$APP/i18n.sh" ""; do
+  [[ -z "$CDAR_I18N" || -f "$CDAR_I18N" ]] && break
+done
+if [[ -n "$CDAR_I18N" ]]; then
+  # shellcheck source=i18n.sh
+  source "$CDAR_I18N"
+else
+  _() { local s="$1"; shift; if (($#)); then printf -- "$s" "$@"; else printf '%s' "$s"; fi; }
+  cdar_detect_lang() { echo uk; }
+fi
+if [[ -z "${CDAR_UI_LANG:-}" ]]; then
+  CDAR_UI_LANG="$(sed -n 's/^UI_LANG=//p' "$CONFIG_FILE" 2>/dev/null | tail -n1)"
+  [[ "$CDAR_UI_LANG" == en || "$CDAR_UI_LANG" == uk ]] || CDAR_UI_LANG="$(cdar_detect_lang)"
+fi
+export CDAR_UI_LANG
+
+# ---------------------------------------------------------------------------
+# Програвачі НЕ зашиті в скрипт: список береться з системи — з .desktop-файлів
+# встановлених програм (звичайних і Flatpak/Snap), так само як це робить меню.
+#   1) програми з адаптером (players/*.sh) або з MimeType x-content/audio-cdda;
+#   2) інші аудіопрогравачі (Categories Audio/Player + MimeType audio/*).
+#
+# Як саме відкрити диск у конкретній програмі, знає її адаптер — окремий
+# скрипт у теці players/. Шукаються в такому порядку (перший виграє):
+#   ~/.config/cd-auto-runner/players/   — ваші власні адаптери
+#   <тека скрипта>/players/              — під час запуску з репозиторію
+#   ~/.local/share/cd-auto-runner/players/ — встановлені
+# Програми без адаптера отримують адресу cdda://ПРИСТРІЙ (players/_generic.sh).
+# ---------------------------------------------------------------------------
+# Значення конфігурації за замовчуванням
+PLAYER_ID=""
+PLAYER_NAME=""
+PLAYER_CMD=""   # лише для власної команди (PLAYER_ID=custom)
+NOTIFY="yes"
+RIP_FORMAT="flac" # формат для програвачів, яким треки копіюються (Elisa, QMPlay2)
+LIBRARY="yes"     # зберігати скопійовані альбоми в теку музики (як Windows Media Player)
+LIBRARY_DIR=""    # порожньо — XDG MUSIC (напр. ~/Музика)
+ONLINE="yes"      # назви, рік і обкладинка з MusicBrainz
+UI_LANG=""        # мова інтерфейсу: uk | en (порожньо — мова системи)
+
+# ---------------------------------------------------------------------------
+# Допоміжні функції
+# ---------------------------------------------------------------------------
+log()  { printf '%s\n' "$*" >&2; }
+die()  { log "$(_ 'Помилка: %s' "$*")"; exit 1; }
+yes_answer() { [[ "$1" =~ ^[тТyYтак] ]]; }
+yn_hint() { [[ "$CDAR_UI_LANG" == en ]] && echo "[Y/n]" || echo "[Т/н]"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+has_display() { [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; }
+
+use_gui() { [[ "${CDAR_TTY:-0}" != 1 ]] && have kdialog && has_display; }
+
+notify() {
+  [[ "$NOTIFY" == "yes" ]] || return 0
+  have notify-send && has_display || return 0
+  notify-send -a "$APP_TITLE" -i "$ICON" "$1" "${2:-}" >/dev/null 2>&1 || true
+}
+
+load_config() {
+  [[ -r "$CONFIG_FILE" ]] || return 1
+  local key value
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    case "$key" in
+      PLAYER_ID)   PLAYER_ID="$value" ;;
+      PLAYER_NAME) PLAYER_NAME="$value" ;;
+      PLAYER_CMD)  PLAYER_CMD="$value" ;;
+      NOTIFY)      NOTIFY="$value" ;;
+      RIP_FORMAT)  RIP_FORMAT="$value" ;;
+      LIBRARY)     LIBRARY="$value" ;;
+      LIBRARY_DIR) LIBRARY_DIR="$value" ;;
+      ONLINE)      ONLINE="$value" ;;
+      UI_LANG)     UI_LANG="$value" ;;
+    esac
+  done < "$CONFIG_FILE"
+  return 0
+}
+
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  local tmp
+  tmp="$(mktemp "$CONFIG_DIR/.config.XXXXXX")"
+  {
+    echo "# $(_ 'Конфігурація %s. Змінити: %s choose' "$APP_TITLE" "$APP")"
+    echo "# $(_ 'PLAYER_ID — id .desktop-файлу програми; custom — власна команда; off — вимкнено.')"
+    echo "# $(_ '{dev} у PLAYER_CMD (лише для custom) замінюється на шлях до приводу.')"
+    echo "PLAYER_ID=$PLAYER_ID"
+    echo "PLAYER_NAME=$PLAYER_NAME"
+    echo "PLAYER_CMD=$PLAYER_CMD"
+    echo "NOTIFY=$NOTIFY"
+    echo "# $(_ 'Формат копіювання треків: flac | opus | ogg | mp3 | wav')"
+    echo "RIP_FORMAT=$RIP_FORMAT"
+    echo "# $(_ 'yes — зберігати альбом у теку музики: Виконавець/Альбом/NN - Назва')"
+    echo "LIBRARY=$LIBRARY"
+    echo "# $(_ 'Тека бібліотеки; порожньо — системна тека «Музика»')"
+    echo "LIBRARY_DIR=$LIBRARY_DIR"
+    echo "# $(_ 'yes — брати назви, рік і обкладинку з MusicBrainz')"
+    echo "ONLINE=$ONLINE"
+    echo "# $(_ 'Мова інтерфейсу: uk | en')"
+    echo "UI_LANG=$UI_LANG"
+  } > "$tmp"
+  mv -f "$tmp" "$CONFIG_FILE"
+}
+
+# Теки з .desktop-файлами в порядку пріоритету XDG (+ Flatpak/Snap про всяк випадок,
+# бо в середовищі служби systemd XDG_DATA_DIRS може бути неповним)
+desktop_dirs() {
+  local IFS=: d
+  local -A seen=()
+  for d in "${XDG_DATA_HOME:-$HOME/.local/share}" ${XDG_DATA_DIRS:-/usr/local/share:/usr/share} \
+           "$HOME/.local/share/flatpak/exports/share" /var/lib/flatpak/exports/share /var/lib/snapd/desktop; do
+    d="${d%/}/applications"
+    [[ -d "$d" && -z "${seen[$d]:-}" ]] || continue
+    seen[$d]=1; echo "$d"
+  done
+}
+
+# Виводить TSV: рівень(1|2) id назва Exec flatpak-id
+scan_desktop_entries() {
+  local lang="${LANGUAGE:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}"
+  lang="${lang%%[.:@]*}"
+  local files=() d f
+  while IFS= read -r d; do
+    for f in "$d"/*.desktop; do [[ -f "$f" ]] && files+=("$f"); done
+  done < <(desktop_dirs)
+  ((${#files[@]})) || return 0
+  awk -v lang="$lang" -v short="${lang%%_*}" '
+    function flush() {
+      if (file == "") return
+      if (id in seen) return
+      seen[id] = 1
+      if (type != "Application" || hidden == "true" || exec == "") return
+      cdda = (";" mime ";") ~ /;x-content\/audio-cdda;/
+      cats2 = ";" cats ";"
+      player = (cats2 ~ /;Audio;/ || cats2 ~ /;Player;/) && mime ~ /(^|;)audio\// \
+               && cats2 !~ /;AudioVideoEditing;/ && nodisplay != "true"
+      tier = cdda ? 1 : (player ? 2 : 0)
+      if (!tier) return
+      n = (nl != "") ? nl : ((ns != "") ? ns : name)
+      gsub(/\t/, " ", exec)
+      printf "%d\t%s\t%s\t%s\t%s\n", tier, id, n, exec, fp
+    }
+    FNR == 1 {
+      flush()
+      file = FILENAME; id = FILENAME; sub(/.*\//, "", id)
+      grp = 0; type = name = nl = ns = exec = mime = cats = hidden = nodisplay = fp = ""
+    }
+    /^\[/ { grp = ($0 == "[Desktop Entry]"); next }
+    grp {
+      k = $0; sub(/=.*/, "", k); v = $0; sub(/^[^=]*=/, "", v)
+      if (k == "Type") type = v
+      else if (k == "Name") name = v
+      else if (lang != "" && k == "Name[" lang "]") nl = v
+      else if (short != "" && k == "Name[" short "]") ns = v
+      else if (k == "Exec") exec = v
+      else if (k == "MimeType") mime = v
+      else if (k == "Categories") cats = v
+      else if (k == "Hidden") hidden = v
+      else if (k == "NoDisplay") nodisplay = v
+      else if (k == "X-Flatpak") fp = v
+    }
+    END { flush() }
+  ' "${files[@]}" | sort -t$'\t' -k1,1n -k3,3f
+}
+
+adapter_dirs() {
+  local d
+  # власні адаптери користувача → тека поруч зі скриптом (запуск із репозиторію) → встановлені
+  for d in "$CONFIG_DIR/players" "$(dirname "$SELF")/players" "$DATA_DIR/$APP/players"; do
+    [[ -d "$d" ]] && echo "$d"
+  done
+}
+
+# Заповнює ADAPTER_FOR[desktop-id]=файл, ADAPTER_NOTE[файл]=опис і CDAR_LIB
+load_adapters() {
+  declare -gA ADAPTER_FOR=() ADAPTER_NOTE=()
+  CDAR_LIB=""; GENERIC_ADAPTER=""; RIP_ADAPTER=""; TAG_ADAPTER=""
+  local d f id ids
+  while IFS= read -r d; do
+    [[ -z "$CDAR_LIB" && -f "$d/_lib.sh" ]] && CDAR_LIB="$d/_lib.sh"
+    [[ -z "$GENERIC_ADAPTER" && -f "$d/_generic.sh" ]] && GENERIC_ADAPTER="$d/_generic.sh"
+    [[ -z "$RIP_ADAPTER" && -f "$d/_rip.sh" ]] && RIP_ADAPTER="$d/_rip.sh"
+    [[ -z "$TAG_ADAPTER" && -f "$d/_tag.sh" ]] && TAG_ADAPTER="$d/_tag.sh"
+    for f in "$d"/*.sh; do
+      [[ -f "$f" && "$(basename "$f")" != _* ]] || continue
+      ids="$(sed -n 's/^# cdar-desktop-ids:[[:space:]]*//p' "$f" | head -n1)"
+      ADAPTER_NOTE[$f]="$(sed -n 's/^# cdar-note:[[:space:]]*//p' "$f" | head -n1)"
+      for id in $ids; do [[ -z "${ADAPTER_FOR[$id]:-}" ]] && ADAPTER_FOR[$id]="$f"; done
+    done
+  done < <(adapter_dirs)
+}
+
+# Файли mimeapps.list у порядку пріоритету (специфікація XDG MIME Applications)
+mimeapps_files() {
+  local IFS=: d de
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}" data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  for de in ${XDG_CURRENT_DESKTOP:-}; do echo "$cfg/${de,,}-mimeapps.list"; done
+  echo "$cfg/mimeapps.list"
+  for d in ${XDG_CONFIG_DIRS:-/etc/xdg}; do
+    for de in ${XDG_CURRENT_DESKTOP:-}; do echo "$d/${de,,}-mimeapps.list"; done
+    echo "$d/mimeapps.list"
+  done
+  echo "$data/applications/mimeapps.list"
+  for d in ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do echo "$d/applications/mimeapps.list"; done
+}
+
+# Перша встановлена програма з [Default Applications] для MIME-типу
+mime_default() {
+  local type="$1" f v app i
+  while IFS= read -r f; do
+    [[ -r "$f" ]] || continue
+    v="$(awk -v t="$type" '/^\[/{g=($0=="[Default Applications]")} g && index($0, t "=")==1 {sub(/^[^=]*=/,""); print; exit}' "$f")"
+    [[ -n "$v" ]] || continue
+    local IFS=';'
+    for app in $v; do
+      for i in "${!FOUND_IDS[@]}"; do [[ "${FOUND_IDS[$i]}" == "$app" ]] && { echo "$app"; return 0; }; done
+    done
+    unset IFS
+  done < <(mimeapps_files)
+  return 1
+}
+
+# Визначає типовий програвач: DEFAULT_ID і DEFAULT_WHY
+#   1) явно заданий для Audio CD (x-content/audio-cdda);
+#   2) «Програвач музики» з налаштувань KDE / системи (audio/mpeg, audio/ogg, audio/flac),
+#      але лише якщо він точно вміє Audio CD (рівень 1).
+find_default() {
+  DEFAULT_ID=""; DEFAULT_WHY=""
+  local t
+  if DEFAULT_ID="$(mime_default x-content/audio-cdda)"; then DEFAULT_WHY="$(_ 'типовий для Audio CD')"; return 0; fi
+  local i
+  for t in audio/mpeg audio/ogg audio/flac audio/x-flac; do
+    if DEFAULT_ID="$(mime_default "$t")"; then
+      for i in "${!FOUND_IDS[@]}"; do
+        if [[ "${FOUND_IDS[$i]}" == "$DEFAULT_ID" && "${FOUND_TIER[$i]}" == 1 ]]; then
+          DEFAULT_WHY="$(_ 'ваш програвач музики')"; return 0
+        fi
+      done
+      break
+    fi
+  done
+  DEFAULT_ID=""
+}
+
+# Заповнює масиви FOUND_IDS / FOUND_NAMES / FOUND_EXEC / FOUND_TIER / FOUND_FLATPAK / FOUND_ADAPTER
+detect_players() {
+  FOUND_IDS=(); FOUND_NAMES=(); FOUND_EXEC=(); FOUND_TIER=(); FOUND_FLATPAK=(); FOUND_ADAPTER=()
+  load_adapters
+  local tier id name exec fp row pass
+  local -a rows=()
+  while IFS=$'\t' read -r tier id name exec fp; do
+    [[ -n "${ADAPTER_FOR[$id]:-}" ]] && tier=1   # є адаптер — програма точно вміє CD
+    rows+=("$tier"$'\t'"$id"$'\t'"$name"$'\t'"$exec"$'\t'"$fp")
+  done < <(scan_desktop_entries)
+  for pass in 1 2; do
+    for row in "${rows[@]}"; do
+      IFS=$'\t' read -r tier id name exec fp <<< "$row"
+      [[ "$tier" == "$pass" ]] || continue
+      FOUND_IDS+=("$id"); FOUND_NAMES+=("$name"); FOUND_EXEC+=("$exec"); FOUND_TIER+=("$tier")
+      FOUND_FLATPAK+=("$fp"); FOUND_ADAPTER+=("${ADAPTER_FOR[$id]:-}")
+    done
+  done
+  find_default
+}
+
+find_player() {  # find_player <desktop-id> → індекс
+  local i
+  for i in "${!FOUND_IDS[@]}"; do [[ "${FOUND_IDS[$i]}" == "$1" ]] && { echo "$i"; return 0; }; done
+  return 1
+}
+
+player_label() {  # player_label <індекс>
+  local i="$1" l="${FOUND_NAMES[$1]}"
+  [[ -n "${FOUND_FLATPAK[$i]}" ]] && l+=" [Flatpak]"
+  local note="${FOUND_ADAPTER[$i]:+${ADAPTER_NOTE[${FOUND_ADAPTER[$i]}]:-}}"
+  [[ "$note" == "копіює треки" ]] && l+=" — $(_ 'копіює треки з диска')"
+  [[ "${FOUND_TIER[$i]}" == 2 ]] && l+=" — $(_ 'підтримку CD не заявлено')"
+  [[ -n "$DEFAULT_ID" && "${FOUND_IDS[$i]}" == "$DEFAULT_ID" ]] && l+=" ★ $DEFAULT_WHY"
+  printf '%s' "$l"
+}
+
+# Чи є на диску аудіотреки
+disc_has_audio() {
+  udevadm info --query=property --name="$1" 2>/dev/null \
+    | grep -q '^ID_CDROM_MEDIA_TRACK_COUNT_AUDIO=[1-9]'
+}
+
+audio_track_count() {
+  local n
+  n="$(udevadm info --query=property --name="$1" 2>/dev/null | sed -n 's/^ID_CDROM_MEDIA_TRACK_COUNT_AUDIO=//p')"
+  [[ "$n" =~ ^[0-9]+$ ]] && ((n > 0)) && echo "$n" || echo 1
+}
+
+list_drives() {
+  local d
+  for d in /dev/sr*; do [[ -b "$d" ]] && echo "$d"; done
+}
+
+valid_device() { [[ "$1" =~ ^/dev/[A-Za-z0-9_/.-]+$ ]]; }
+
+# ---------------------------------------------------------------------------
+# Команди
+# ---------------------------------------------------------------------------
+cmd_list() {
+  detect_players
+  if ((${#FOUND_IDS[@]} == 0)); then
+    _ 'У системі не знайдено аудіопрогравачів. Можна вказати власну команду: %s choose' "$APP"; echo
+    return 3
+  fi
+  local i
+  for i in "${!FOUND_IDS[@]}"; do
+    printf '%s\t%s\t%s\n' "${FOUND_IDS[$i]}" "$(player_label "$i")" \
+      "$(basename "${FOUND_ADAPTER[$i]:-${GENERIC_ADAPTER:-_generic.sh}}")"
+  done
+}
+
+# Flatpak-програмам потрібен доступ:
+#   програвачам, що читають диск напряму (VLC, mpv), — до CD-приводу;
+#   програвачам, яким треки копіюються, — до теки ~/.cache/cd-auto-runner (лише читання),
+#   інакше файли йдуть через портал документів, а він кешує вміст і після
+#   перемикання на ще не скопійований трек програвач грав би тишу.
+# Який дозвіл Flatpak потрібен (порожньо — нічого): needed_override <flatpak-id> <device|files>
+needed_override() {
+  local fid="$1" mode="$2" perms
+  perms="$(flatpak info --show-permissions "$fid" 2>/dev/null)"
+  if [[ "$mode" == files ]]; then
+    local fs; fs=";$(sed -n 's/^filesystems=//p' <<< "$perms");"
+    [[ "$fs" =~ \;(host|home|xdg-cache|xdg-cache/$APP)(:r[ow])?\; ]] || echo "--filesystem=xdg-cache/$APP:ro"
+  else
+    grep -q '^devices=.*all' <<< "$perms" || echo "--device=all"
+  fi
+}
+
+fix_flatpak_permissions() {
+  local fid="$1" mode="${2:-device}" q override
+  override="$(needed_override "$fid" "$mode")"
+  [[ -n "$override" ]] || return 0
+  if [[ "$mode" == files ]]; then
+    q="$(_ '%s у Flatpak не бачить теку зі скопійованими треками. Надати доступ лише до неї (flatpak override --user %s %s)?' "$PLAYER_NAME" "$override" "$fid")"
+  else
+    q="$(_ '%s у Flatpak не має доступу до CD-приводу. Надати доступ (flatpak override --user %s %s)?' "$PLAYER_NAME" "$override" "$fid")"
+  fi
+  local ok=1
+  if use_gui; then
+    kdialog --title "$APP_TITLE" --yesno "$q" && ok=0
+  elif [[ -t 0 ]]; then
+    read -rp "$q $(yn_hint) " ans; [[ "$ans" =~ ^([нНnN]) ]] || ok=0
+  fi
+  if ((ok == 0)); then
+    flatpak override --user "$override" "$fid" && log "$(_ 'Доступ надано: %s %s' "$fid" "$override")"
+  fi
+}
+
+# Формат, у який копіюються треки для Elisa/QMPlay2
+choose_format() {
+  local -a f=(flac opus ogg mp3 wav)
+  local -a d=("$(_ 'FLAC — без втрат, з тегами')" "$(_ 'Opus 160 кбіт/с — малий розмір')" "Ogg Vorbis q6"
+              "$(_ 'MP3 VBR ~190 кбіт/с')" "$(_ 'WAV — без перекодування, без тегів')")
+  local q="${1:-}"
+  if [[ -n "$q" ]]; then :
+  elif [[ "$LIBRARY" == yes ]]; then
+    q="$(_ '%s не відкриває диск напряму: треки буде скопійовано в бібліотеку музики (Виконавець/Альбом). У якому форматі?' "$PLAYER_NAME")"
+  else
+    q="$(_ '%s не відкриває диск напряму: треки буде скопійовано. У якому форматі?' "$PLAYER_NAME")"
+  fi
+  local i pick=""
+  if use_gui; then
+    local args=()
+    for i in "${!f[@]}"; do args+=("${f[$i]}" "${d[$i]}" "$([[ "${f[$i]}" == "$RIP_FORMAT" ]] && echo on || echo off)"); done
+    pick="$(kdialog --title "$APP_TITLE" --radiolist "$q" "${args[@]}")" || return 1
+  else
+    echo "$q"
+    for i in "${!f[@]}"; do
+      printf '  %d) %s%s\n' "$((i + 1))" "${d[$i]}" "$([[ "${f[$i]}" == "$RIP_FORMAT" ]] && echo "  [$(_ 'поточний')]")"
+    done
+    local n
+    while :; do
+      read -rp "$(_ 'Формат [1-%s, Enter — %s]: ' "${#f[@]}" "$RIP_FORMAT")" n || return 1
+      [[ -z "$n" ]] && { pick="$RIP_FORMAT"; break; }
+      [[ "$n" =~ ^[1-5]$ ]] && { pick="${f[$((n - 1))]}"; break; }
+      _ 'Невірний номер.'; echo
+    done
+  fi
+  RIP_FORMAT="${pick:-flac}"
+}
+
+cmd_choose() {
+  # Без kdialog і без терміналу (запуск з меню) — відкриваємо Konsole
+  if ! use_gui && [[ ! -t 0 && "${CDAR_TTY:-0}" != 1 ]]; then
+    if have konsole && has_display; then
+      exec konsole --hide-menubar -e "$SELF" choose --tty
+    fi
+    die "$(_ 'немає ні kdialog, ні терміналу для вибору програвача')"
+  fi
+
+  load_config || true
+  detect_players
+  local i
+  local ids=() names=() labels=() fps=()
+  for i in "${!FOUND_IDS[@]}"; do
+    ids+=("${FOUND_IDS[$i]}"); names+=("${FOUND_NAMES[$i]}")
+    fps+=("${FOUND_FLATPAK[$i]}"); labels+=("$(player_label "$i")")
+  done
+  ids+=("custom" "off"); names+=("$(_ 'Власна команда')" "$(_ 'вимкнено')"); fps+=("" "")
+  labels+=("$(_ 'Власна команда…')" "$(_ 'Нічого не запускати (вимкнути автозапуск)')")
+  # Поточний вибір: з конфігурації → типовий у системі → перший зі списку
+  local current="${PLAYER_ID:-${DEFAULT_ID:-${FOUND_IDS[0]:-}}}"
+
+  local choice=""
+  if use_gui; then
+    local args=()
+    for i in "${!ids[@]}"; do
+      args+=("${ids[$i]}" "${labels[$i]}" "$([[ "${ids[$i]}" == "$current" ]] && echo on || echo off)")
+    done
+    choice="$(kdialog --title "$APP_TITLE" --icon "$ICON" \
+      --radiolist "$(_ 'Що запускати, коли вставлено аудіо-CD?')" "${args[@]}")" || { log "$(_ 'Скасовано.')"; return 1; }
+  else
+    _ 'Що запускати, коли вставлено аудіо-CD?'; echo
+    for i in "${!ids[@]}"; do
+      printf '  %d) %s%s\n' "$((i + 1))" "${labels[$i]}" "$([[ "${ids[$i]}" == "$current" ]] && echo "  [$(_ 'поточний')]")"
+    done
+    local n
+    while :; do
+      read -rp "$(_ 'Ваш вибір [1-%s, Enter — залишити поточний]: ' "${#ids[@]}")" n || return 1
+      if [[ -z "$n" && -n "$current" ]]; then choice="$current"; break; fi
+      if [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 1 && n <= ${#ids[@]})); then choice="${ids[$((n - 1))]}"; break; fi
+      _ 'Невірний номер.'; echo
+    done
+  fi
+  [[ -n "$choice" ]] || { log "$(_ 'Нічого не обрано.')"; return 1; }
+
+  if [[ "$choice" == "custom" ]]; then
+    local prompt; prompt="$(_ 'Команда для запуску. {dev} буде замінено на шлях до приводу, напр.: vlc cdda://{dev}')"
+    local def="$PLAYER_CMD" custom=""
+    [[ -n "$def" ]] || def='vlc cdda://{dev}'
+    if use_gui; then
+      custom="$(kdialog --title "$APP_TITLE" --inputbox "$prompt" "$def")" || { log "$(_ 'Скасовано.')"; return 1; }
+    else
+      echo "$prompt"
+      read -rp "> " -e -i "$def" custom || return 1
+    fi
+    [[ -n "${custom// /}" ]] || die "$(_ 'команда порожня')"
+    PLAYER_ID="custom"; PLAYER_NAME="$(_ 'Власна команда')"; PLAYER_CMD="$custom"
+  elif [[ "$choice" == "off" ]]; then
+    PLAYER_ID="off"; PLAYER_NAME="$(_ 'вимкнено')"; PLAYER_CMD=""
+  else
+    PLAYER_NAME=""
+    for i in "${!ids[@]}"; do
+      if [[ "${ids[$i]}" == "$choice" ]]; then
+        PLAYER_ID="$choice"; PLAYER_NAME="${names[$i]}"; PLAYER_CMD=""
+        if [[ -n "${FOUND_ADAPTER[$i]:-}" && "${ADAPTER_NOTE[${FOUND_ADAPTER[$i]}]:-}" == "копіює треки" ]]; then
+          [[ -n "${fps[$i]}" ]] && fix_flatpak_permissions "${fps[$i]}" files
+          choose_format || return 1
+        else
+          [[ -n "${fps[$i]}" ]] && fix_flatpak_permissions "${fps[$i]}" device
+        fi
+      fi
+    done
+    [[ -n "$PLAYER_NAME" ]] || die "$(_ 'невідомий вибір: %s' "$choice")"
+  fi
+
+  save_config
+  [[ -f "$SOLID_FILE" ]] && cmd_solid >/dev/null
+  local msg; msg="$(_ 'Обрано: %s' "$PLAYER_NAME")"
+  [[ "$PLAYER_ID" == "off" ]] && msg="$(_ 'Автозапуск вимкнено (служба продовжує працювати, але нічого не запускатиме).')"
+  if use_gui; then
+    kdialog --title "$APP_TITLE" --passivepopup "$msg" 4 >/dev/null 2>&1 &
+  fi
+  echo "$msg"
+  [[ "$PLAYER_ID" != off ]] && { _ 'Перевірити команду: %s play -n' "$APP"; echo; }
+  return 0
+}
+
+cmd_play() {
+  local dry=0 dev="" want="" rip=0
+  while (($#)); do
+    case "$1" in
+      -n|--dry-run) dry=1 ;;
+      --rip) rip=1 ;;
+      -p|--player) want="${2:-}"; shift ;;
+      --player=*) want="${1#*=}" ;;
+      *) dev="$1" ;;
+    esac
+    shift
+  done
+  if [[ -z "$dev" ]]; then
+    local d
+    for d in $(list_drives); do disc_has_audio "$d" && { dev="$d"; break; }; done
+    [[ -n "$dev" ]] || dev="$(list_drives | head -n1)"
+  fi
+  [[ -n "$dev" ]] || die "$(_ 'CD-привід не знайдено')"
+  valid_device "$dev" || die "$(_ 'некоректний шлях до пристрою: %s' "$dev")"
+
+  load_config || true
+  ((rip)) && want="rip"
+  [[ -n "$want" ]] || want="$PLAYER_ID"
+  if [[ "$want" == "off" ]]; then log "$(_ 'Автозапуск вимкнено в налаштуваннях.')"; return 0; fi
+
+  local tracks; tracks="$(audio_track_count "$dev")"
+
+  # Власна команда
+  if [[ "$want" == "custom" ]]; then
+    [[ -n "$PLAYER_CMD" ]] || die "$(_ 'власна команда порожня. Запустіть: %s choose' "$APP")"
+    local cmd="${PLAYER_CMD//\{dev\}/$dev}"
+    if ((dry)); then echo "$cmd"; return 0; fi
+    log "$(_ 'Аудіо-CD у %s → запускаю: %s' "$dev" "$cmd")"
+    notify "$(_ 'Аудіо-CD')" "$(_ 'Запускаю власну команду…')"
+    run_detached "$APP_TITLE: $(_ 'власна команда')" sh -c "$cmd"
+    return
+  fi
+
+  detect_players
+  local i adapter name exec fp id
+  if [[ "$want" == rip ]]; then
+    [[ -n "$RIP_ADAPTER" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено players/_rip.sh. Перевстановіть %s.' "$APP")"
+    adapter="$RIP_ADAPTER"; name="$(_ 'Бібліотека музики')"; exec="true"; fp=""; id="rip"
+  else
+  if [[ -z "$want" ]]; then
+    want="$DEFAULT_ID"
+    [[ -n "$want" ]] || die "$(_ 'програвач ще не обрано. Запустіть: %s choose' "$APP")"
+    log "$(_ 'Програвач не обрано — беру типовий: %s' "$want")"
+  fi
+  i="$(find_player "$want")" || die "$(_ 'програму %s не знайдено в системі. Запустіть: %s choose' "$want" "$APP")"
+  adapter="${FOUND_ADAPTER[$i]:-$GENERIC_ADAPTER}"
+  [[ -n "$adapter" && -f "$adapter" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено адаптерів (players/). Перевстановіть %s.' "$APP")"
+  name="${FOUND_NAMES[$i]}"; exec="${FOUND_EXEC[$i]}"; fp="${FOUND_FLATPAK[$i]}"; id="${FOUND_IDS[$i]}"
+  fi
+
+  local -a env=(
+    "CDAR_LIB=$CDAR_LIB" "CDAR_DEVICE=$dev" "CDAR_TRACKS=$tracks"
+    "CDAR_EXEC=$exec" "CDAR_DESKTOP_ID=$id" "CDAR_NAME=$name"
+    "CDAR_FLATPAK=$fp" "CDAR_NOTIFY=$NOTIFY" "CDAR_DRY_RUN=$dry"
+    "CDAR_RIP_FORMAT=$RIP_FORMAT" "CDAR_LIBRARY=$LIBRARY" "CDAR_LIBRARY_DIR=$LIBRARY_DIR" "CDAR_ONLINE=$ONLINE"
+    "CDAR_UI_LANG=$CDAR_UI_LANG" "CDAR_I18N=$CDAR_I18N" "CDAR_SELF=$SELF"
+  )
+  if ((dry)); then
+    echo "# $(_ 'адаптер: %s' "$adapter")"
+    env "${env[@]}" bash "$adapter"
+    return
+  fi
+  # Попереднє фонове копіювання (напр. альбом докопіюється в бібліотеку після закриття
+  # Elisa/QMPlay2) читало б диск одночасно з новим програвачем — звук переривався б.
+  # Зупиняємо його; скопійовані треки збережуться, решта докопіюється наступного разу.
+  if [[ -n "$(systemctl --user list-units "$APP-play-*" --no-legend --plain 2>/dev/null)" ]]; then
+    log "$(_ 'Зупиняю попереднє копіювання диска')"
+    cmd_stop >/dev/null
+  fi
+  log "$(_ 'Аудіо-CD у %s (треків: %s) → %s [%s]' "$dev" "$tracks" "$name" "$(basename "$adapter")")"
+  [[ "$id" == rip ]] || notify "$(_ 'Аудіо-CD')" "$(_ 'Запускаю %s…' "$name")"
+  # Адаптер працює в окремому юніті: копіювання треків не залежить від служби
+  run_detached "$APP_TITLE: $name" env "${env[@]}" bash "$adapter"
+}
+
+run_detached() {  # run_detached <опис> <команда…>
+  local desc="$1"; shift
+  if have systemd-run && systemctl --user show-environment >/dev/null 2>&1; then
+    systemd-run --user --quiet --collect --unit="$APP-play-$(date +%s%N)" \
+      --description="$desc" -- "$@" && return 0
+  fi
+  setsid -f "$@" >/dev/null 2>&1 < /dev/null
+}
+
+# Генерує дії для меню «Диски і пристрої» (Plasma Device Notifier):
+# «Відтворити обраним», окремий пункт для кожного програвача з підтримкою CD і «Обрати…»
+cmd_solid() {
+  detect_players
+  load_config || true
+  mkdir -p "$(dirname "$SOLID_FILE")"
+  local tmp actions="play;" i n=0 key cur_key=""
+  local -a pick=()
+  local -A seen=()
+  # Одна дія на адаптер (два .desktop-файли VLC → один пункт); поточний програвач — у «play»
+  if [[ -n "$PLAYER_ID" ]] && i="$(find_player "$PLAYER_ID")"; then cur_key="${FOUND_ADAPTER[$i]:-$PLAYER_ID}"; fi
+  for i in "${!FOUND_IDS[@]}"; do
+    [[ "${FOUND_TIER[$i]}" == 1 ]] || continue
+    key="${FOUND_ADAPTER[$i]:-${FOUND_IDS[$i]}}"
+    [[ "$key" == "$cur_key" || -n "${seen[$key]:-}" ]] && continue
+    seen[$key]=1; pick+=("$i"); actions+="p$i;"
+  done
+  tmp="$(mktemp "${SOLID_FILE}.XXXXXX")"
+  actions+="rip;tag;choose;"
+  {
+    echo "# Generated by: $APP solid. Do not edit — the file is overwritten."
+    echo "[Desktop Entry]"
+    echo "X-KDE-Solid-Predicate=[StorageVolume.ignored == false AND OpticalDisc.availableContent & 'Audio']"
+    echo "Type=Service"
+    echo "Actions=$actions"
+    echo "X-KDE-Priority=TopLevel"
+    echo
+    echo "[Desktop Action play]"
+    if [[ -n "$PLAYER_ID" && "$PLAYER_ID" != off && "$PLAYER_ID" != custom ]] && i="$(find_player "$PLAYER_ID")"; then
+      echo "Name=Play in ${FOUND_NAMES[$i]}"
+      echo "Name[uk]=Відтворити: ${FOUND_NAMES[$i]}"
+    else
+      echo "Name=Play with the chosen player"
+      echo "Name[uk]=Відтворити обраним програвачем"
+    fi
+    echo "Icon=media-playback-start"
+    echo "Exec=$SELF play %d"
+    for i in "${pick[@]}"; do
+      echo
+      echo "[Desktop Action p$i]"
+      echo "Name=Play in ${FOUND_NAMES[$i]}"
+      echo "Name[uk]=Відтворити у ${FOUND_NAMES[$i]}"
+      echo "Icon=${FOUND_IDS[$i]%.desktop}"
+      echo "Exec=$SELF play --player ${FOUND_IDS[$i]} %d"
+      n=$((n + 1))
+    done
+    echo
+    echo "[Desktop Action rip]"
+    echo "Name=Rip to music library"
+    echo "Name[uk]=Скопіювати диск у бібліотеку музики"
+    echo "Icon=media-import-audio-cd"
+    echo "Exec=$SELF rip %d"
+    echo
+    echo "[Desktop Action tag]"
+    echo "Name=Enter track titles…"
+    echo "Name[uk]=Ввести назви треків…"
+    echo "Icon=document-edit"
+    echo "Exec=$SELF tag %d"
+    echo
+    echo "[Desktop Action choose]"
+    echo "Name=Open CD Auto Runner…"
+    echo "Name[uk]=Відкрити CD Auto Runner…"
+    echo "Icon=media-optical-audio"
+    echo "Exec=$SELF settings"
+  } > "$tmp"
+  mv -f "$tmp" "$SOLID_FILE"
+  _ 'Меню «Диски і пристрої»: %s (дій: %s)' "$SOLID_FILE" "$((n + 4))"; echo
+}
+
+# ---------------------------------------------------------------------------
+# Команди для графічного вікна (gui.py): прості, без діалогів
+# ---------------------------------------------------------------------------
+# set <ключ> <значення>
+cmd_set() {
+  local k="${1:-}" v="${2-}"
+  load_config || true
+  case "$k" in
+    RIP_FORMAT) [[ "$v" =~ ^(flac|opus|ogg|mp3|wav)$ ]] || die "$(_ 'невідомий формат: %s' "$v")"; RIP_FORMAT="$v" ;;
+    LIBRARY|ONLINE|NOTIFY) [[ "$v" == yes || "$v" == no ]] || die "yes | no"; printf -v "$k" '%s' "$v" ;;
+    LIBRARY_DIR) LIBRARY_DIR="$v" ;;
+    *) die "$(_ 'невідомий параметр: %s' "$k")" ;;
+  esac
+  save_config
+}
+
+# set-player <desktop-id | off>
+cmd_set_player() {
+  local id="${1:-}" i
+  load_config || true
+  if [[ "$id" == off ]]; then PLAYER_ID=off; PLAYER_NAME="$(_ 'вимкнено')"; PLAYER_CMD=""
+  else
+    detect_players
+    i="$(find_player "$id")" || die "$(_ 'програму %s не знайдено в системі. Запустіть: %s choose' "$id" "$APP")"
+    PLAYER_ID="$id"; PLAYER_NAME="${FOUND_NAMES[$i]}"; PLAYER_CMD=""
+  fi
+  save_config
+  [[ -f "$SOLID_FILE" ]] && cmd_solid >/dev/null
+  return 0
+}
+
+# perm <desktop-id> → «override<TAB>flatpak-id», якщо програмі бракує дозволу Flatpak
+cmd_perm() {
+  local id="${1:-}" i mode
+  detect_players
+  i="$(find_player "$id")" || return 0
+  [[ -n "${FOUND_FLATPAK[$i]}" ]] || return 0
+  mode=device
+  [[ -n "${FOUND_ADAPTER[$i]:-}" && "${ADAPTER_NOTE[${FOUND_ADAPTER[$i]}]:-}" == "копіює треки" ]] && mode=files
+  local o; o="$(needed_override "${FOUND_FLATPAK[$i]}" "$mode")"
+  [[ -n "$o" ]] && printf '%s\t%s\n' "$o" "${FOUND_FLATPAK[$i]}"
+  return 0
+}
+
+# info [ПРИСТРІЙ] → відомості про диск у форматі ключ=значення (для gui.py)
+cmd_info() {
+  local dev
+  dev="$(pick_device "${1:-}")"
+  load_config || true
+  load_adapters
+  [[ -n "$CDAR_LIB" && -f "$(dirname "$CDAR_LIB")/_info.sh" ]] || die "$(_ 'не знайдено адаптерів (players/). Перевстановіть %s.' "$APP")"
+  env "CDAR_LIB=$CDAR_LIB" "CDAR_DEVICE=$dev" "CDAR_TRACKS=$(audio_track_count "$dev")" \
+      "CDAR_EXEC=true" "CDAR_NAME=$APP_TITLE" "CDAR_NOTIFY=no" "CDAR_DRY_RUN=0" \
+      "CDAR_RIP_FORMAT=$RIP_FORMAT" "CDAR_LIBRARY=$LIBRARY" "CDAR_LIBRARY_DIR=$LIBRARY_DIR" \
+      "CDAR_ONLINE=$ONLINE" "CDAR_UI_LANG=$CDAR_UI_LANG" "CDAR_I18N=$CDAR_I18N" \
+      bash "$(dirname "$CDAR_LIB")/_info.sh"
+}
+
+# Перший привід з аудіо-CD (або вказаний)
+pick_device() {
+  local dev="${1:-}" d
+  if [[ -z "$dev" ]]; then
+    for d in $(list_drives); do disc_has_audio "$d" && { dev="$d"; break; }; done
+  fi
+  [[ -n "$dev" ]] || die "$(_ 'аудіо-CD не знайдено')"
+  valid_device "$dev" || die "$(_ 'некоректний шлях до пристрою: %s' "$dev")"
+  printf '%s' "$dev"
+}
+
+# Ввести назви треків для диска, якого немає в базах
+cmd_tag() {
+  local dev=""
+  for a in "$@"; do [[ "$a" == --* ]] || dev="$a"; done
+  # Без kdialog і без терміналу (запуск з меню) — відкриваємо Konsole
+  if ! use_gui && [[ ! -t 0 && "${CDAR_TTY:-0}" != 1 ]]; then
+    if have konsole && has_display; then exec konsole --hide-menubar -e "$SELF" tag --tty $dev; fi
+    die "$(_ 'немає ні kdialog, ні терміналу')"
+  fi
+  dev="$(pick_device "$dev")"
+  load_config || true
+  load_adapters
+  [[ -n "$TAG_ADAPTER" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено players/_tag.sh. Перевстановіть %s.' "$APP")"
+  env "CDAR_LIB=$CDAR_LIB" "CDAR_DEVICE=$dev" "CDAR_TRACKS=$(audio_track_count "$dev")" \
+      "CDAR_EXEC=true" "CDAR_NAME=$APP_TITLE" "CDAR_NOTIFY=$NOTIFY" "CDAR_DRY_RUN=0" \
+      "CDAR_RIP_FORMAT=$RIP_FORMAT" "CDAR_LIBRARY=$LIBRARY" "CDAR_LIBRARY_DIR=$LIBRARY_DIR" \
+      "CDAR_ONLINE=$ONLINE" "CDAR_UI_LANG=$CDAR_UI_LANG" "CDAR_I18N=$CDAR_I18N" "CDAR_SELF=$SELF" \
+      "CDAR_TTY=${CDAR_TTY:-0}" bash "$TAG_ADAPTER"
+}
+
+# Сповіщення «назви невідомі» з кнопкою «Ввести назви…» (запускає адаптер копіювання)
+cmd_ask_tag() {
+  local dev="${1:-}" act
+  have notify-send && has_display || return 0
+  act="$(notify-send -a "$APP_TITLE" -i "$ICON" -A "tag=$(_ 'Ввести назви…')" \
+    "$(_ 'Назви треків невідомі')" \
+    "$(_ 'Цього диска немає в MusicBrainz. Можна ввести назви треків вручну — або просто слухати далі.')" 2>/dev/null)"
+  [[ "$act" == tag ]] && cmd_tag "$dev"
+  return 0
+}
+
+cmd_stop() {
+  local n=0 u
+  while read -r u _; do
+    [[ -n "$u" ]] || continue
+    systemctl --user stop "$u" 2>/dev/null && n=$((n + 1))
+  done < <(systemctl --user list-units "$APP-play-*" --no-legend --plain 2>/dev/null)
+  pkill -u "$USER" -f "(cd-paranoia|cdparanoia) .*${XDG_CACHE_HOME:-$HOME/.cache}/$APP" 2>/dev/null && n=$((n + 1))
+  if ((n)); then _ 'Копіювання зупинено.'; else _ 'Нічого не копіюється.'; fi; echo
+}
+
+cmd_clean() {
+  cmd_stop >/dev/null
+  local c="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
+  if [[ -d "$c" ]] && rm -rf -- "$c"; then _ 'Видалено скопійовані треки: %s' "$c"; else _ 'Кеш порожній.'; fi; echo
+}
+
+cmd_watch() {
+  have udevadm || die "$(_ 'udevadm не знайдено')"
+  # Лише один екземпляр на сеанс
+  local lock="${XDG_RUNTIME_DIR:-/tmp}/$APP.lock"
+  exec 9> "$lock"
+  if have flock && ! flock -n 9; then
+    log "$(_ 'Вже запущено інший екземпляр %s watch.' "$APP")"; exit 0
+  fi
+
+  declare -A loaded=()
+  local d
+  for d in $(list_drives); do disc_has_audio "$d" && loaded[$d]=1; done
+  [[ -f "$SOLID_FILE" ]] && cmd_solid >/dev/null 2>&1
+  log "$(_ '%s %s: стежу за CD-приводами (%s)' "$APP_TITLE" "$VERSION" "$(list_drives | tr '\n' ' ')")"
+
+  local line action="" devname="" media="" audio=""
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then
+      case "$line" in
+        ACTION=*) action="${line#ACTION=}" ;;
+        DEVNAME=*) devname="${line#DEVNAME=}" ;;
+        ID_CDROM_MEDIA=*) media="${line#ID_CDROM_MEDIA=}" ;;
+        ID_CDROM_MEDIA_TRACK_COUNT_AUDIO=*) audio="${line#ID_CDROM_MEDIA_TRACK_COUNT_AUDIO=}" ;;
+      esac
+      continue
+    fi
+
+    # Порожній рядок = кінець події
+    if [[ "$devname" == /dev/sr* ]]; then
+      if [[ "$action" == "remove" || "$media" != "1" ]]; then
+        [[ -n "${loaded[$devname]:-}" ]] && log "$(_ 'Диск вийнято з %s' "$devname")"
+        rm -f -- "${XDG_RUNTIME_DIR:-/tmp}/$APP/toc-$(basename "$devname")"   # кеш змісту диска
+        unset "loaded[$devname]"
+      elif [[ "$action" == "change" && "${audio:-0}" =~ ^[1-9] && -z "${loaded[$devname]:-}" ]]; then
+        loaded[$devname]=1
+        log "$(_ 'Виявлено аудіо-CD (треків: %s) у %s' "$audio" "$devname")"
+        cmd_play "$devname" || log "$(_ 'Не вдалося запустити програвач')"
+      fi
+    fi
+    action=""; devname=""; media=""; audio=""
+  done < <(udevadm monitor --udev --subsystem-match=block --property)
+
+  log "$(_ 'udevadm monitor завершився несподівано')"
+  exit 1
+}
+
+cmd_status() {
+  echo "$APP_TITLE $VERSION"
+  # вирівнювання за символами, а не байтами (кирилиця — 2 байти)
+  row() { local l="$1:"; printf '%s%*s %s\n' "$l" $((12 - ${#l})) '' "$2"; }
+  if load_config; then
+    row "$(_ 'Програвач')" "$PLAYER_NAME ($PLAYER_ID)"
+    [[ "$PLAYER_ID" == custom ]] && row "$(_ 'Команда')" "$PLAYER_CMD"
+  else
+    row "$(_ 'Програвач')" "$(_ 'не обрано (%s choose)' "$APP")"
+  fi
+  row "$(_ 'Мова')" "$CDAR_UI_LANG"
+  if systemctl --user cat "$SERVICE" >/dev/null 2>&1; then
+    row "$(_ 'Служба')" "$(_ '%s, автозапуск: %s' "$(systemctl --user is-active "$SERVICE" 2>/dev/null)" "$(systemctl --user is-enabled "$SERVICE" 2>/dev/null)")"
+  elif [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP.desktop" ]]; then
+    row "$(_ 'Служба')" "XDG autostart; $(pgrep -f "$APP watch" >/dev/null && _ 'працює' || _ 'не запущена')"
+  else
+    row "$(_ 'Служба')" "$(_ 'не встановлена (запустіть install.sh)')"
+  fi
+  local d
+  for d in $(list_drives); do
+    if disc_has_audio "$d"; then row "$(_ 'Привід')" "$d — $(_ 'аудіо-CD')"
+    elif udevadm info --query=property --name="$d" 2>/dev/null | grep -q '^ID_CDROM_MEDIA=1'; then row "$(_ 'Привід')" "$d — $(_ 'диск (не аудіо)')"
+    else row "$(_ 'Привід')" "$d — $(_ 'порожній')"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Головне вікно: меню керування (kdialog, а без нього — термінал)
+# ---------------------------------------------------------------------------
+menu_pick() {  # menu_pick <питання> ключ підпис … → ключ
+  local q="$1"; shift
+  if use_gui; then
+    kdialog --title "$APP_TITLE" --icon "$ICON" --geometry 600x560 --menu "$q" "$@"
+    return
+  fi
+  local -a keys=() labels=()
+  while (($#)); do keys+=("$1"); labels+=("$2"); shift 2; done
+  printf '\n%s\n' "$q" >&2
+  local i n
+  for i in "${!keys[@]}"; do printf '  %2d) %s\n' $((i + 1)) "${labels[$i]}" >&2; done
+  read -rp "$(_ 'Ваш вибір (Enter — вийти): ')" n || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] && ((n >= 1 && n <= ${#keys[@]})) || return 1
+  echo "${keys[$((n - 1))]}"
+}
+
+yesno_label() { if [[ "$1" == yes ]]; then _ 'так'; else _ 'ні'; fi; }
+
+library_root() {
+  local d="$LIBRARY_DIR"
+  [[ -z "$d" ]] && have xdg-user-dir && d="$(xdg-user-dir MUSIC 2>/dev/null)"
+  [[ -z "$d" || "$d" == "$HOME" ]] && d="$HOME/Music"
+  printf '%s' "$d"
+}
+
+show_text() {  # show_text <текст> [error]
+  if use_gui; then
+    kdialog --title "$APP_TITLE" "$([[ "${2:-}" == error ]] && echo --sorry || echo --msgbox)" "$1" 2>/dev/null
+  else
+    printf '%s\n' "$1"
+  fi
+}
+
+# Виконати дію в підоболонці: «die» не закриває меню, а помилку видно у вікні
+run_action() {
+  local out
+  if ! use_gui; then ( "$@" ) || true; return 0; fi
+  if ! out="$( ( "$@" ) 2>&1 )"; then
+    show_text "${out:-$(_ 'Не вдалося виконати дію.')}" error
+  fi
+}
+
+cmd_settings() {
+  # Повноцінне вікно (PySide6), якщо можна; інакше — меню kdialog / термінал
+  local gui
+  for gui in "$(dirname "$SELF")/gui/gui.py" "$DATA_DIR/$APP/gui.py"; do
+    if [[ -f "$gui" && "${CDAR_TTY:-0}" != 1 ]] && has_display && python3 -c 'import PySide6.QtWidgets' 2>/dev/null; then
+      CDAR_UI_LANG="$CDAR_UI_LANG" CDAR_SELF="$SELF" exec python3 -I "$gui"
+    fi
+  done
+  if ! use_gui && [[ ! -t 0 && "${CDAR_TTY:-0}" != 1 ]]; then
+    if have konsole && has_display; then exec konsole --hide-menubar -e "$SELF" settings --tty; fi
+    die "$(_ 'немає ні kdialog, ні терміналу')"
+  fi
+  local pick svc d
+  while :; do
+    load_config || true
+    svc="$(systemctl --user is-enabled "$SERVICE" 2>/dev/null || true)"
+    pick="$(menu_pick "$(_ 'CD Auto Runner %s — що зробити?' "$VERSION")" \
+      player  "$(_ 'Програвач: %s' "${PLAYER_NAME:-—}")" \
+      format  "$(_ 'Формат копіювання: %s' "$RIP_FORMAT")" \
+      library "$(_ 'Зберігати альбоми в бібліотеку музики: %s' "$(yesno_label "$LIBRARY")")" \
+      libdir  "$(_ 'Тека бібліотеки: %s' "$(library_root)")" \
+      online  "$(_ 'Назви й обкладинки з MusicBrainz: %s' "$(yesno_label "$ONLINE")")" \
+      notify  "$(_ 'Сповіщення: %s' "$(yesno_label "$NOTIFY")")" \
+      service "$(_ 'Автозапуск при вставлянні диска: %s' "$([[ "$svc" == enabled ]] && _ 'увімкнено' || _ 'вимкнено')")" \
+      lang    "Мова / Language: $([[ "$CDAR_UI_LANG" == en ]] && echo English || echo Українська)" \
+      play    "$(_ '▶ Відтворити диск зараз')" \
+      rip     "$(_ '⤓ Скопіювати диск у бібліотеку')" \
+      tag     "$(_ '✎ Ввести назви треків…')" \
+      stop    "$(_ '■ Зупинити копіювання')" \
+      open    "$(_ 'Відкрити теку бібліотеки')" \
+      clean   "$(_ 'Видалити тимчасові файли')" \
+      status  "$(_ 'Стан')")" || return 0
+    [[ -n "$pick" ]] || return 0
+    case "$pick" in
+      player)  run_action cmd_choose ;;
+      format)  if choose_format "$(_ 'У якому форматі копіювати треки (Elisa, QMPlay2, Audacious, бібліотека)?')"; then save_config; fi ;;
+      library) LIBRARY="$([[ "$LIBRARY" == yes ]] && echo no || echo yes)"; save_config ;;
+      online)  ONLINE="$([[ "$ONLINE" == yes ]] && echo no || echo yes)"; save_config ;;
+      notify)  NOTIFY="$([[ "$NOTIFY" == yes ]] && echo no || echo yes)"; save_config ;;
+      libdir)
+        if use_gui; then d="$(kdialog --title "$APP_TITLE" --getexistingdirectory "$(library_root)")" || continue
+        else read -rp "$(_ 'Тека бібліотеки (Enter — системна «Музика»): ')" d || continue; fi
+        LIBRARY_DIR="$d"; save_config ;;
+      service)
+        if ! systemctl --user cat "$SERVICE" >/dev/null 2>&1; then show_text "$(_ 'Служба не встановлена. Запустіть install.sh.')" error
+        elif [[ "$svc" == enabled ]]; then run_action cmd_service disable
+        else run_action cmd_service enable; fi ;;
+      lang)    cmd_lang >/dev/null || true ;;
+      play)    run_action cmd_play ;;
+      rip)     run_action cmd_play --rip ;;
+      tag)     run_action cmd_tag ;;
+      stop)    show_text "$(cmd_stop)" ;;
+      open)    have xdg-open && { mkdir -p "$(library_root)"; xdg-open "$(library_root)" >/dev/null 2>&1 & } ;;
+      clean)   show_text "$(cmd_clean)" ;;
+      status)  show_text "$(cmd_status)" ;;
+    esac
+  done
+}
+
+# Мова інтерфейсу: cd-auto-runner lang [uk|en]
+cmd_lang() {
+  local l="${1:-}"
+  if [[ -z "$l" ]]; then
+    local cur="$CDAR_UI_LANG"
+    if use_gui; then
+      l="$(kdialog --title "$APP_TITLE" --radiolist "Мова / Language" \
+        en English "$([[ $cur == en ]] && echo on || echo off)" \
+        uk Українська "$([[ $cur == uk ]] && echo on || echo off)")" || return 1
+    else
+      echo "Мова / Language:"
+      echo "  1) English$([[ $cur == en ]] && echo '  *')"
+      echo "  2) Українська$([[ $cur == uk ]] && echo '  *')"
+      local n; read -rp "[1-2, Enter — $cur]: " n || return 1
+      case "$n" in 1) l=en ;; 2) l=uk ;; *) l="$cur" ;; esac
+    fi
+  fi
+  [[ "$l" == en || "$l" == uk ]] || die "$(_ 'невідома мова: %s (можна uk або en)' "$l")"
+  load_config || true
+  UI_LANG="$l"; CDAR_UI_LANG="$l"
+  save_config
+  [[ -f "$SOLID_FILE" ]] && cmd_solid >/dev/null
+  _ 'Мова інтерфейсу: %s' "$([[ $l == en ]] && echo English || echo Українська)"; echo
+}
+
+cmd_service() {
+  case "$1" in
+    enable)  systemctl --user enable --now "$SERVICE" && { _ 'Автозапуск увімкнено.'; echo; } ;;
+    disable) systemctl --user disable --now "$SERVICE" && { _ 'Автозапуск вимкнено.'; echo; } ;;
+  esac
+}
+
+usage() {
+  _ '%s %s — автозапуск обраного програвача для аудіо-CD
+
+Використання: %s <команда> [параметри]
+
+  settings            вікно керування (усе, що нижче, без термінала)
+  choose [--tty]      обрати програвач (kdialog або термінал)
+  play [ПРИСТРІЙ]     запустити програвач для диска (за замовч. — перший аудіо-CD)
+      -p, --player ID інша програма (id з «list»), напр. org.kde.elisa.desktop
+      -n, --dry-run   лише показати команду
+  rip [ПРИСТРІЙ]      скопіювати диск у бібліотеку музики (Виконавець/Альбом), без відтворення
+  tag [ПРИСТРІЙ]      ввести назви треків (для дисків, яких немає в MusicBrainz)
+  stop                зупинити копіювання треків
+  clean               видалити скопійовані треки (~/.cache/%s)
+  watch               стежити за приводами (це запускає служба systemd)
+  status              показати налаштування і стан
+  list                показати знайдені програвачі та їхні адаптери
+  solid               оновити пункти в меню «Диски і пристрої»
+  lang [uk|en]        мова інтерфейсу
+  enable | disable    увімкнути/вимкнути службу
+  -h, --help          ця довідка
+  -V, --version       версія
+
+Конфігурація: %s
+' "$APP_TITLE" "$VERSION" "$APP" "$APP" "$CONFIG_FILE"
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  for a in "$@"; do [[ "$a" == "--tty" ]] && CDAR_TTY=1; done
+  case "$cmd" in
+    choose|--choose|-c) cmd_choose ;;
+    settings|gui)       cmd_settings ;;
+    set)                cmd_set "$@" ;;
+    set-player)         cmd_set_player "$@" ;;
+    perm)               cmd_perm "$@" ;;
+    info)               cmd_info "$@" ;;
+    play)               cmd_play "$@" ;;
+    watch|daemon)       cmd_watch ;;
+    status)             cmd_status ;;
+    list)               cmd_list ;;
+    lang)               cmd_lang "$@" ;;
+    solid)              cmd_solid ;;
+    stop)               cmd_stop ;;
+    rip)                cmd_play --rip "$@" ;;
+    tag)                cmd_tag "$@" ;;
+    ask-tag)            cmd_ask_tag "$@" ;;
+    clean)              cmd_clean ;;
+    enable|disable)     cmd_service "$cmd" ;;
+    -V|--version)       echo "$APP $VERSION" ;;
+    -h|--help|help)     usage ;;
+    *)                  usage; exit 2 ;;
+  esac
+}
+
+main "$@"

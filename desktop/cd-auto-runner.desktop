@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=CD Auto Runner
+Comment=Audio CD autoplay: player, music library, track titles
+Comment[uk]=Автозапуск аудіо-CD: програвач, бібліотека музики, назви треків
+GenericName=Audio CD autoplay
+GenericName[uk]=Автозапуск аудіо-CD
+Exec=@BIN@ settings
+Icon=media-optical-audio
+Terminal=false
+Categories=AudioVideo;Audio;Settings;
+Keywords=cd;audio;autoplay;autorun;player;диск;програвач;автозапуск;
