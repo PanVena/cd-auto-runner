@@ -29,7 +29,7 @@ from PySide6.QtCore import QObject, QProcess, QRectF, QSettings, QSize, Qt, QThr
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPalette, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
     QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSlider, QSplitter, QSystemTrayIcon, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -654,6 +654,22 @@ def card():
     return f
 
 
+def section(title):
+    """Картка налаштувань із жирним заголовком; повертає (картка, QFormLayout для рядків)."""
+    box = card()
+    lay = QVBoxLayout(box)
+    lay.setContentsMargins(16, 12, 16, 14)
+    lay.setSpacing(8)
+    head = QLabel(title)
+    head.setObjectName("section")
+    lay.addWidget(head)
+    form = QFormLayout()
+    form.setHorizontalSpacing(10)
+    form.setVerticalSpacing(8)
+    lay.addLayout(form)
+    return box, form
+
+
 class MainWindow(QMainWindow):
     COVER = 168
     request_info = Signal()     # виклик InfoWorker.load у фоновому потоці (queued)
@@ -703,7 +719,8 @@ class MainWindow(QMainWindow):
                           background: rgba(246,116,0,45); color: #f67400; }}
             QPushButton {{ padding: 7px 14px; }}
             QPushButton#primary {{ font-weight: 600; padding: 8px 22px; }}
-            QGroupBox {{ font-weight: 600; }}
+            QLabel#section {{ font-weight: 600; }}
+            QSplitter::handle {{ background: transparent; }}
         """)
 
         root = QWidget()
@@ -1226,8 +1243,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
 
-        g1 = QGroupBox(_("Відтворення"))
-        f1 = QFormLayout(g1)
+        g1, f1 = section(_("Відтворення"))
         self.player = QComboBox()
         self.player.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.player.setMinimumContentsLength(18)
@@ -1241,8 +1257,7 @@ class MainWindow(QMainWindow):
         f1.addRow(self.chk_notify)
         lay.addWidget(g1)
 
-        g2 = QGroupBox(_("Копіювання і бібліотека"))
-        f2 = QFormLayout(g2)
+        g2, f2 = section(_("Копіювання і бібліотека"))
         self.fmt = QComboBox()
         for key, text in (("flac", "FLAC — без втрат"), ("opus", "Opus 160 кбіт/с — малий розмір"),
                           ("ogg", "Ogg Vorbis q6"), ("mp3", "MP3 VBR ~190 кбіт/с"),
@@ -1275,8 +1290,7 @@ class MainWindow(QMainWindow):
         f2.addRow(note)
         lay.addWidget(g2)
 
-        g3 = QGroupBox(_("Інтерфейс"))
-        f3 = QFormLayout(g3)
+        g3, f3 = section(_("Інтерфейс"))
         self.lang = QComboBox()
         self.lang.addItem("English", "en")
         self.lang.addItem("Українська", "uk")
@@ -1573,6 +1587,7 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
         if state:
             self.split.restoreState(state)
+        self.split.setHandleWidth(12)   # після restoreState — він повертає збережену ширину ручки
 
     def save_layout(self):
         settings = QSettings(APP, "gui")
