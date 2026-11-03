@@ -33,7 +33,7 @@
 ## Встановлення
 
 ```bash
-git clone https://github.com/<ваш-логін>/cd-auto-runner.git
+git clone https://github.com/PanVena/cd-auto-runner.git
 cd cd-auto-runner
 ./install.sh
 ```
