@@ -4,18 +4,21 @@
 Вікно показує стан і викликає cd-auto-runner (CDAR_SELF): уся логіка копіювання — у скрипті.
 Вбудований програвач відтворює скопійовані треки через mpv (окремий процес, керування —
 JSON IPC через локальний сокет) і показує себе системі через MPRIS (віджет «Програвач»,
-мультимедійні клавіші); вікно згортається в системний лоток. Тексти українською;
+мультимедійні клавіші); вікно згортається в системний лоток. Картка «Бібліотека» відкриває
+вже скопійовані диски замість вставленого (або коли диска немає). Тексти українською;
 EN — англійський переклад (CDAR_UI_LANG).
 
   gui.py [--play] [ПРИСТРІЙ]   --play — одразу відтворювати диск у вбудованому програвачі
 
 CD Auto Runner main window. Ripping logic lives in the cd-auto-runner script; the built-in
 player plays ripped tracks through mpv, controlled over its JSON IPC socket, and is exposed
-to the desktop over MPRIS; the window hides to the system tray.
+to the desktop over MPRIS; the window hides to the system tray. The Library card opens
+already ripped discs instead of the inserted one (or when there is none).
 
 SPDX-License-Identifier: GPL-2.0-only
 Copyright (C) 2026 Pan Vena
 """
+import concurrent.futures
 import glob
 import json
 import os
@@ -25,13 +28,16 @@ import shutil
 import subprocess
 import sys
 
-from PySide6.QtCore import QObject, QProcess, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPalette, QPixmap
+from PySide6.QtCore import QObject, QProcess, QRect, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QIcon, QImageReader, QPainter, QPainterPath, QPalette, QPixmap,
+)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout,
-    QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSlider, QSplitter, QSystemTrayIcon, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QHeaderView, QLabel, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QSlider, QSplitter, QStyle, QStyledItemDelegate,
+    QSystemTrayIcon, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 try:    # MPRIS — необов'язково: без dbus-python програвач просто не видно у віджеті «Програвач»
@@ -143,6 +149,12 @@ EN = {
     "Ліцензія: GNU GPL версії 2.": "License: GNU GPL version 2.",
     "Відтворюю диск. Керувати ним можна зі значка в лотку або з віджета «Програвач».":
         "Playing the disc. Control it from the tray icon or the Media Player widget.",
+    "Бібліотека": "Library",
+    "Диск у приводі": "Disc in the drive",
+    "Тут з'являтимуться скопійовані диски.": "Ripped discs will appear here.",
+    "Двічі клацніть альбом, щоб відтворити його.": "Double-click an album to play it.",
+    "Не вдалося відкрити альбом.": "Failed to open the album.",
+    "Запускаю {name}…": "Starting {name}…",
 }
 
 
@@ -461,7 +473,7 @@ if dbus is not None:
                 return dbus.Dictionary({"mpris:trackid": dbus.ObjectPath(NO_TRACK)}, signature="sv")
             t = w.track_title(n) or {}
             info = w.info
-            meta = {"mpris:trackid": self.track_id(n), "xesam:trackNumber": dbus.Int32(n),
+            meta = {"mpris:trackid": self.track_id(n), "xesam:trackNumber": dbus.Int32(t.get("num", n)),
                     "xesam:title": dbus.String(t.get("title") or _("Трек {n}", n=n))}
             sec = w.length if w.want is None and w.length > 0 else t.get("sec", 0)
             if sec:
@@ -633,6 +645,114 @@ class InfoWorker(QObject):
         self.done.emit(info)
 
 
+# --- бібліотека: скопійовані диски --------------------------------------------------------
+MARKER = ".cd-auto-runner"
+COVER_NAMES = ("cover.jpg", "cover.png", "folder.jpg", "Folder.jpg", "front.jpg")
+THUMB = 256         # обкладинка плитки, із запасом для HiDPI
+TRACK_FILE = re.compile(r"(\d{1,3})\s*(?:[-._]\s*|\s)(.+)")
+# «Виконавець - Назва»: як у _cdar_read_titles (players/_lib.sh)
+ARTIST_TITLE = (re.compile(r"(.*\S)\s+-\s*(\S.*)"), re.compile(r"(.*\S)\s*-\s+(\S.*)"))
+
+
+def read_marker(folder):
+    """Мітка альбому (players/_lib.sh, _cdar_write_marker): відомості й назви треків."""
+    meta = {}
+    try:
+        with open(os.path.join(folder, MARKER), encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.rstrip("\n").split("=", 1)
+                    meta[k] = v
+    except (OSError, UnicodeDecodeError):
+        pass
+    return meta
+
+
+def read_album(folder, root):
+    """Тека бібліотеки як альбом — у тому ж вигляді, що й відомості про диск (InfoWorker).
+    Треки — файли, що справді є в теці; мітка дає лише назви, тож теки без неї теж
+    відкриваються. n — позиція в альбомі, num — номер на диску. None, якщо аудіо немає."""
+    try:
+        names = [e.name for e in os.scandir(folder)
+                 if os.path.splitext(e.name)[1].lower() in AUDIO_EXT and e.is_file()]
+    except OSError:
+        return None
+    if not names:
+        return None
+    meta = read_marker(folder)
+    parent = os.path.dirname(folder)
+    artist = meta.get("ALBUM_ARTIST") or (os.path.basename(parent) if parent != root else "")
+    files = []
+    for name in names:
+        stem = os.path.splitext(name)[0]
+        m = TRACK_FILE.fullmatch(stem)
+        files.append((int(m[1]), name, m[2]) if m else (10 ** 6, name, stem))
+    tracks = []
+    for pos, (num, name, title) in enumerate(sorted(files), 1):
+        track_artist, line = artist, meta.get(f"{num:02d}", "")
+        num = pos if num == 10 ** 6 else num
+        for pattern in ARTIST_TITLE:
+            m = pattern.fullmatch(line)
+            if m:
+                track_artist, line = m[1], m[2]
+                break
+        tracks.append({"n": pos, "num": num, "artist": track_artist, "title": line or title, "sec": 0,
+                       "state": "library", "placeholder": False, "path": os.path.join(folder, name)})
+    cover = next((p for p in (os.path.join(folder, c) for c in COVER_NAMES) if os.path.isfile(p)), "")
+    return {"ALBUM_DIR": folder, "LIBRARY_DIR": folder, "SOURCE": "library", "COVER": cover,
+            "ALBUM": meta.get("ALBUM") or os.path.basename(folder), "ALBUM_ARTIST": artist,
+            "YEAR": meta.get("YEAR", ""), "tracks": tracks}
+
+
+def scan_library(root):
+    """Альбоми бібліотеки: теки з аудіо до трьох рівнів углиб (Виконавець/Альбом/Диск 1)."""
+    albums = []
+    root = root.rstrip(os.sep)
+    for folder, dirs, _files in os.walk(root):
+        depth = folder[len(root):].count(os.sep)
+        dirs[:] = [d for d in dirs if not d.startswith(".")] if depth < 3 else []
+        album = read_album(folder, root) if depth else None
+        if album:
+            albums.append(album)
+    albums.sort(key=lambda a: (a["ALBUM_ARTIST"].casefold(), a["ALBUM"].casefold()))
+    return albums
+
+
+def thumbnail(path):
+    """Зменшена обкладинка; QImage, а не QPixmap — читається у фоновому потоці."""
+    reader = QImageReader(path)
+    size = reader.size()
+    if size.isValid():
+        reader.setScaledSize(size.scaled(THUMB, THUMB, Qt.KeepAspectRatioByExpanding))
+    return reader.read()
+
+
+def track_seconds(path):
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=10).stdout
+        return int(float(out))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0
+
+
+class LibraryWorker(QObject):
+    """Окремий потік: InfoWorker може чекати на диск і MusicBrainz до двох хвилин."""
+    scanned = Signal(object)        # список альбомів
+    timed = Signal(str, object)     # тека альбому, {шлях: секунд}
+
+    def scan(self, root):
+        albums = scan_library(root)
+        for album in albums:
+            album["thumb"] = thumbnail(album["COVER"]) if album["COVER"] else None
+        self.scanned.emit(albums)
+
+    def durations(self, folder, paths):
+        if shutil.which("ffprobe"):
+            with concurrent.futures.ThreadPoolExecutor(4) as pool:
+                self.timed.emit(folder, dict(zip(paths, pool.map(track_seconds, paths))))
+
+
 # --- вигляд ------------------------------------------------------------------------------
 def rounded_pixmap(pix, size, radius=12):
     pix = pix.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
@@ -646,6 +766,39 @@ def rounded_pixmap(pix, size, radius=12):
     p.drawPixmap(0, 0, pix)
     p.end()
     return out
+
+
+class AlbumTile(QStyledItemDelegate):
+    """Плитка альбому: обкладинка, під нею назва й виконавець в один рядок кожен."""
+    COVER = 128
+    PAD = 8
+    SUBTITLE = Qt.UserRole + 1
+
+    @classmethod
+    def size(cls, metrics):
+        return QSize(cls.COVER + 2 * cls.PAD, cls.COVER + 2 * metrics.height() + 3 * cls.PAD)
+
+    def sizeHint(self, option, _index):
+        return self.size(option.fontMetrics)
+
+    def paint(self, p, option, index):
+        option.widget.style().drawPrimitive(QStyle.PE_PanelItemViewItem, option, p, option.widget)
+        selected = bool(option.state & QStyle.State_Selected)
+        p.save()
+        rect = option.rect.adjusted(self.PAD, self.PAD, -self.PAD, -self.PAD)
+        index.data(Qt.DecorationRole).paint(p, QRect(rect.topLeft(), QSize(self.COVER, self.COVER)))
+        p.setPen(option.palette.color(QPalette.HighlightedText if selected else QPalette.Text))
+        font = index.data(Qt.FontRole) or option.font
+        p.setFont(font)
+        line = option.fontMetrics.height()
+        top = rect.top() + self.COVER + self.PAD // 2
+        p.drawText(QRect(rect.left(), top, rect.width(), line), Qt.AlignLeft | Qt.AlignVCenter,
+                   p.fontMetrics().elidedText(index.data(Qt.DisplayRole), Qt.ElideRight, rect.width()))
+        p.setFont(option.font)
+        p.setOpacity(0.65)
+        p.drawText(QRect(rect.left(), top + line, rect.width(), line), Qt.AlignLeft | Qt.AlignVCenter,
+                   option.fontMetrics.elidedText(index.data(self.SUBTITLE) or "", Qt.ElideRight, rect.width()))
+        p.restore()
 
 
 def card():
@@ -673,13 +826,19 @@ def section(title):
 class MainWindow(QMainWindow):
     COVER = 168
     request_info = Signal()     # виклик InfoWorker.load у фоновому потоці (queued)
+    request_scan = Signal(str)              # LibraryWorker.scan
+    request_times = Signal(str, list)       # LibraryWorker.durations
 
     def __init__(self, play=False):
         super().__init__()
         self.setWindowTitle("CD Auto Runner")
         self.setWindowIcon(QIcon.fromTheme("media-optical-audio"))
-        self.resize(1120, 760)
-        self.info = {}
+        self.resize(1120, 860)
+        self.info = {}              # те, що показано й відтворюється: диск або альбом бібліотеки
+        self.disc = {}              # вставлений диск (показаний він чи ні)
+        self.albums = []
+        self.lib_shown = None       # що зараз у списку бібліотеки (щоб не перебудовувати даремно)
+        self.lib_done = -1          # скільки треків диска скопійовано (нові файли — новий перегляд)
         self.last_tracks = -1
         self.loading = False
         self.proc = None
@@ -760,6 +919,16 @@ class MainWindow(QMainWindow):
         self.request_info.connect(self.worker.load)
         self.thread.start()
 
+        self.lib_thread = QThread(self)
+        self.lib_worker = LibraryWorker()
+        self.lib_worker.moveToThread(self.lib_thread)
+        self.lib_worker.scanned.connect(self.on_scanned)
+        self.lib_worker.timed.connect(self.on_times)
+        self.request_scan.connect(self.lib_worker.scan)
+        self.request_times.connect(self.lib_worker.durations)
+        self.lib_thread.start()
+        self.rescan()
+
         self.timer = QTimer(self)
         self.timer.setInterval(2000)
         self.timer.timeout.connect(self.poll)
@@ -831,6 +1000,7 @@ class MainWindow(QMainWindow):
                                      lambda: QDesktopServices.openUrl(QUrl(self.info.get("MB_URL", ""))))
         menu.addSeparator()
         self.act_eject = menu.addAction(icon("media-eject"), _("Вийняти диск"), self.eject)
+        menu.aboutToShow.connect(lambda: self.act_eject.setEnabled(self.last_tracks > 0))
         menu.addAction(icon("view-refresh"), _("Оновити"), self.reload_info)
         menu.addAction(icon("edit-clear-history"), _("Видалити тимчасові файли"),
                        lambda: self.action("clean"))
@@ -942,14 +1112,39 @@ class MainWindow(QMainWindow):
         pid = read_config().get("PLAYER_ID", "")
         return pid == "builtin" or (pid == "" and self.mpv is not None)
 
+    def plays_here(self):
+        """Показане зараз грає у цьому вікні, а не в обраному зовнішньому програвачі.
+        Альбом — це файли: власна команда отримує лише привід, тож він грає тут."""
+        if self.album_open():
+            return read_config().get("PLAYER_ID", "") in ("", "builtin", "custom", "off")
+        return self.builtin_selected() and self.mpv is not None
+
+    def start_track(self, n):
+        """Відтворює трек n там, де обрано; зовнішній програвач отримує альбом із цього треку."""
+        if self.plays_here():
+            self.play_track(n)
+            return
+        self.stop_playback()            # щоб не грали обидва
+        if self.album_open():
+            self.statusBar().showMessage(_("Запускаю {name}…", name=read_config().get("PLAYER_NAME", "")), 5000)
+            self.action("open", extra=[t["path"] for t in self.info["tracks"][n - 1:]])
+        else:
+            self.action("play")
+
     def track_title(self, n):
         for t in self.info.get("tracks", []):
             if t["n"] == n:
                 return t
         return None
 
+    def album_open(self):
+        """Показано альбом бібліотеки, а не вставлений диск."""
+        return bool(self.info.get("ALBUM_DIR"))
+
     def track_file(self, n):
         """Готовий файл треку: у бібліотеці (закодований) або скопійований WAV у кеші."""
+        if self.album_open():
+            return self.track_title(n)["path"]
         lib, cache = self.info.get("LIBRARY_DIR", ""), self.info.get("CACHE_DIR", "")
         if lib:
             for f in sorted(glob.glob(os.path.join(glob.escape(lib), f"{n:02d} - *"))):
@@ -1033,7 +1228,7 @@ class MainWindow(QMainWindow):
             return
         if self.cur is None:
             sel = self.tree.currentItem()
-            self.play_track(self.tree.indexOfTopLevelItem(sel) + 1 if sel else self.first_track())
+            self.start_track(self.tree.indexOfTopLevelItem(sel) + 1 if sel else self.first_track())
         elif self.want is None:
             self.mpv.toggle()
 
@@ -1100,24 +1295,26 @@ class MainWindow(QMainWindow):
 
     def on_play(self):
         """Кнопка «Відтворити»: вбудований програвач — у цьому вікні, інакше — обраний програвач."""
-        if self.builtin_selected() and self.mpv:
-            if self.cur is None:
-                self.play_track(self.first_track())
-            elif self.is_paused:
-                self.mpv.toggle()
-        else:
-            self.action("play")
+        if not self.plays_here():
+            self.start_track(1)
+        elif self.cur is None:
+            self.play_track(self.first_track())
+        elif self.is_paused:
+            self.mpv.toggle()
 
     def on_track_activated(self, item, _col=0):
-        if self.mpv and self.info.get("tracks"):
-            self.play_track(self.tree.indexOfTopLevelItem(item) + 1)
-        else:
+        if self.info.get("tracks") and (self.mpv or not self.plays_here()):
+            self.start_track(self.tree.indexOfTopLevelItem(item) + 1)
+        elif not self.album_open():
             self.action("tag", reload=True)
 
     def request_play(self):
-        """--play або повідомлення від іншого запуску: відтворити диск з початку."""
-        if self.info.get("tracks") and not self.loading:
+        """--play або повідомлення від іншого запуску: відтворити диск з початку.
+        Вставлений диск важливіший за відкритий альбом: альбом поступається йому."""
+        if self.disc.get("tracks") and not self.loading:
             self.pending_play = False
+            if self.album_open():
+                self.open_disc()
             if self.cur is None:
                 self.play_track(self.first_track())
                 if not self.isVisible():
@@ -1205,7 +1402,7 @@ class MainWindow(QMainWindow):
             self.now.setText(_("Чекаю, поки скопіюється трек {n}…", n=self.want))
         else:
             t = self.track_title(self.cur) or {}
-            text = f"{self.cur:02d}. {t.get('title', '')}"
+            text = f"{t.get('num', self.cur):02d}. {t.get('title', '')}"
             if t.get("artist") and t.get("artist") != self.info.get("ALBUM_ARTIST"):
                 text += f" — {t['artist']}"
             if self.is_paused:
@@ -1308,10 +1505,125 @@ class MainWindow(QMainWindow):
         self.chk_quiet.clicked.connect(lambda v: QSettings(APP, "gui").setValue("play_in_tray", "true" if v else "false"))
         f3.addRow(self.chk_quiet)
         lay.addWidget(g3)
-        lay.addStretch(1)
+        lay.addWidget(self.build_library(), 1)
         area.setWidget(inner)
         area.setMinimumWidth(360)
         return area
+
+    # --- бібліотека: відкрити скопійований диск --------------------------------------------
+    def build_library(self):
+        box, _form = section(_("Бібліотека"))
+        self.lib_empty = QLabel(_("Тут з'являтимуться скопійовані диски."))
+        self.lib_empty.setObjectName("muted")
+        self.lib_list = QListWidget()
+        self.lib_list.setFrameShape(QFrame.NoFrame)
+        self.lib_list.setViewMode(QListView.IconMode)
+        self.lib_list.setMovement(QListView.Static)
+        self.lib_list.setResizeMode(QListView.Adjust)
+        self.lib_list.setUniformItemSizes(True)
+        self.lib_list.setItemDelegate(AlbumTile(self.lib_list))
+        tile = AlbumTile.size(self.lib_list.fontMetrics())
+        self.lib_list.setGridSize(tile + QSize(6, 6))
+        self.lib_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.lib_list.setVerticalScrollMode(QListView.ScrollPerPixel)
+        self.lib_list.verticalScrollBar().setSingleStep(24)
+        self.lib_list.setMinimumHeight(tile.height() + 12)
+        self.lib_list.itemActivated.connect(self.on_library_item)
+        box.layout().addWidget(self.lib_empty)
+        box.layout().addWidget(self.lib_list, 1)
+        return box
+
+    def rescan(self):
+        self.request_scan.emit(self.library_root())
+
+    def on_scanned(self, albums):
+        self.albums = albums
+        self.fill_library()
+
+    def fill_library(self):
+        """Плитки: вставлений диск (якщо є) і скопійовані альбоми; відкрите зараз — жирним."""
+        rows = []
+        if self.disc.get("tracks"):
+            d = self.disc
+            rows.append(("", d.get("ALBUM") or _("Аудіо-CD"), _("Диск у приводі"), d.get("COVER", ""),
+                         d.get("ALBUM_ARTIST", "")))
+        thumbs = {}
+        current = self.info.get("ALBUM_DIR", "") if self.info else None
+        # вставлений диск уже є плиткою; його альбом лишається, лише якщо зараз відкритий
+        same = os.path.normpath(self.disc["LIBRARY_DIR"]) if self.disc.get("LIBRARY_DIR") else None
+        for a in self.albums:
+            if a["ALBUM_DIR"] == same and same != current:
+                continue
+            more = " · ".join(x for x in (a["ALBUM_ARTIST"], a["YEAR"], _("треків: {n}", n=len(a["tracks"]))) if x)
+            rows.append((a["ALBUM_DIR"], a["ALBUM"], a["ALBUM_ARTIST"] or a["YEAR"], a["COVER"], more))
+            thumbs[a["ALBUM_DIR"]] = a["thumb"]
+        if (rows, current) == self.lib_shown:
+            return
+        self.lib_shown = (rows, current)
+        bar = self.lib_list.verticalScrollBar()
+        scroll = bar.value()
+        self.lib_list.clear()
+        bold = QFont(self.lib_list.font())
+        bold.setBold(True)
+        for folder, title, sub, cover, more in rows:
+            item = QListWidgetItem(title)
+            item.setData(AlbumTile.SUBTITLE, sub)
+            image = thumbs.get(folder) if folder else thumbnail(cover) if cover else None
+            if image and not image.isNull():
+                item.setIcon(QIcon(rounded_pixmap(QPixmap.fromImage(image), THUMB, 24)))
+            else:
+                item.setIcon(QIcon.fromTheme("media-optical-audio"))
+            item.setData(Qt.UserRole, folder)
+            hint = "\n".join(x for x in (title, sub if not folder else "", more) if x)
+            item.setToolTip(f"{hint}\n{_('Двічі клацніть альбом, щоб відтворити його.')}")
+            if folder == current:
+                item.setFont(bold)
+            self.lib_list.addItem(item)
+        bar.setValue(scroll)
+        self.lib_empty.setVisible(not rows)
+        self.lib_list.setVisible(bool(rows))
+
+    def on_library_item(self, item):
+        folder = item.data(Qt.UserRole)
+        if folder != self.info.get("ALBUM_DIR", ""):
+            if not folder:
+                self.open_disc()
+            elif not self.open_album(folder):
+                return
+        self.on_play()
+
+    def open_album(self, folder):
+        """Показує альбом замість диска; диск лишається в приводі й копіюється далі."""
+        album = read_album(folder, self.library_root())
+        if not album:
+            self.statusBar().showMessage(_("Не вдалося відкрити альбом."), 5000)
+            self.rescan()
+            return False
+        self.stop_playback()
+        self.pending_play = False
+        self.order = []
+        self.info = album
+        self.show_disc()
+        self.update_states()
+        self.request_times.emit(folder, [t["path"] for t in album["tracks"]])
+        return True
+
+    def open_disc(self):
+        self.stop_playback()
+        self.order = []
+        self.info = self.disc
+        self.show_disc()
+
+    def on_times(self, folder, times):
+        """Тривалості треків альбому: файлів багато, тож вони приходять уже після відкриття."""
+        if self.info.get("ALBUM_DIR") != folder:
+            return
+        for idx, t in enumerate(self.info["tracks"]):
+            t["sec"] = times.get(t["path"], 0)
+            item = self.tree.topLevelItem(idx)
+            if item and t["sec"]:
+                item.setText(3, fmt_time(t["sec"]))
+        self.show_meta()
 
     def build_statusbar(self):
         sb = self.statusBar()
@@ -1373,6 +1685,8 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(_("Збережено"), 2500)
         self.load_settings()
+        if key == "LIBRARY_DIR":
+            self.rescan()
 
     def set_key(self, key, checked):
         self.set_value(key, "yes" if checked else "no")
@@ -1523,10 +1837,11 @@ class MainWindow(QMainWindow):
         self.svc_label.setToolTip(f"{APP}.service: {active or '—'}")
 
     # --- дії ------------------------------------------------------------------------------
-    def action(self, name, reload=False):
+    def action(self, name, reload=False, extra=()):
         if self.proc and self.proc.state() != QProcess.NotRunning and name != "stop":
             return
         args = [name] + ([self.info["DEVICE"]] if name in ("play", "rip", "tag") and self.info.get("DEVICE") else [])
+        args += extra
         proc = QProcess(self)
         proc.setProgram(self_bin())
         proc.setArguments(args)
@@ -1540,7 +1855,7 @@ class MainWindow(QMainWindow):
             self.poll()
         proc.finished.connect(finished)
         proc.start()
-        if name in ("play", "rip", "stop", "clean"):
+        if name in ("play", "open", "rip", "stop", "clean"):
             self.proc = None      # швидкі команди — не блокують інші кнопки
         else:
             self.proc = proc
@@ -1548,8 +1863,9 @@ class MainWindow(QMainWindow):
     def eject(self):
         """Зупиняє копіювання (воно тримає привід) і виймає диск. Решту — вийнятий диск,
         кінець відтворення — зробить poll(), як і тоді, коли диск виймають кнопкою приводу."""
-        dev = self.info.get("DEVICE") or "/dev/sr0"
-        self.stop_playback()
+        dev = self.disc.get("DEVICE") or "/dev/sr0"
+        if not self.album_open():       # відкритий альбом грає з бібліотеки, диск йому не потрібен
+            self.stop_playback()
         self.write_want(None)
         run("stop", timeout=10)
         proc = QProcess(self)
@@ -1604,12 +1920,21 @@ class MainWindow(QMainWindow):
         if self.loading:
             return
         self.loading = True
-        self.show_loading()
+        if not self.album_open():
+            self.show_loading()
         self.request_info.emit()
 
     def on_info(self, info):
         self.loading = False
-        if udev_audio_tracks() == 0:
+        self.rescan()
+        inserted = udev_audio_tracks() != 0
+        self.disc = info if inserted and info.get("ok") else {}
+        self.titles_stamp = self.titles_mtime()
+        # відкритий альбом лишається, поки диск не почнуть відтворювати
+        if self.album_open() and not (self.disc and self.pending_play):
+            self.fill_library()
+            return
+        if not inserted:
             self.stop_playback()
             self.info = {}
             self.show_empty()
@@ -1624,17 +1949,17 @@ class MainWindow(QMainWindow):
         if info.get("DISC_ID") != self.info.get("DISC_ID"):
             self.order = []
         self.info = info
-        self.titles_stamp = self.titles_mtime()
         self.show_disc()
         if self.pending_play:
             self.request_play()
 
     def set_buttons(self, enabled):
-        for b in (self.btn_play, self.btn_rip, self.btn_tag, self.btn_stop):
+        disc = enabled and not self.album_open()    # копіювати й називати можна лише диск
+        for b in (self.btn_play, self.btn_stop):
             b.setEnabled(enabled)
+        for b in (self.btn_rip, self.btn_tag, self.act_mb):
+            b.setEnabled(disc)
         self.act_album.setEnabled(enabled)
-        self.act_mb.setEnabled(enabled)
-        self.act_eject.setEnabled(enabled)
 
     def set_cover(self, path=""):
         pix = QPixmap(path) if path else QPixmap()
@@ -1654,6 +1979,7 @@ class MainWindow(QMainWindow):
         self.set_buttons(False)
         self.btn_stop.setEnabled(True)
         self.update_player()
+        self.fill_library()
 
     def show_loading(self):
         self.title.setText(_("Читаю диск…"))
@@ -1670,8 +1996,7 @@ class MainWindow(QMainWindow):
         if i.get("YEAR"):
             sub += f"  ·  {i['YEAR']}"
         self.subtitle.setText(sub)
-        total = sum(t["sec"] for t in i["tracks"])
-        self.meta.setText(f"{_('треків: {n}', n=len(i['tracks']))}  ·  {fmt_time(total)}")
+        self.show_meta()
         src = i.get("SOURCE", "none")
         labels = {"musicbrainz": "Назви з MusicBrainz", "library": "З бібліотеки",
                   "user": "Назви введено вручну", "kde": "Кеш KDE", "none": "Диска немає в базах"}
@@ -1683,6 +2008,13 @@ class MainWindow(QMainWindow):
         self.btn_tag.setText(_("Ввести назви"))
         self.set_buttons(True)
         self.fill_tracks()
+        self.fill_library()
+
+    def show_meta(self):
+        tracks = self.info["tracks"]
+        total = sum(t["sec"] for t in tracks)
+        text = _("треків: {n}", n=len(tracks))
+        self.meta.setText(f"{text}  ·  {fmt_time(total)}" if total else text)
 
     def fill_tracks(self):
         self.tree.clear()
@@ -1690,7 +2022,11 @@ class MainWindow(QMainWindow):
         italic = QFont(self.font())
         italic.setItalic(True)
         for t in self.info.get("tracks", []):
-            item = QTreeWidgetItem([f"{t['n']:02d}", t["artist"], t["title"], fmt_time(t["sec"]), ""])
+            item = QTreeWidgetItem([f"{t.get('num', t['n']):02d}", t["artist"], t["title"],
+                                    fmt_time(t["sec"]) if t["sec"] else "", ""])
+            if t.get("path"):
+                item.setText(4, _("у бібліотеці"))
+                item.setIcon(4, icon("emblem-ok-symbolic"))
             item.setTextAlignment(0, Qt.AlignRight | Qt.AlignVCenter)
             item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
             if t["placeholder"]:
@@ -1712,7 +2048,9 @@ class MainWindow(QMainWindow):
         return int(m.group(1)) if m else None
 
     def update_states(self):
-        i = self.info
+        """Стан копіювання вставленого диска — навіть коли показано альбом бібліотеки."""
+        i = self.disc
+        shown = not self.album_open()
         if not i.get("tracks"):
             self.progress.hide()
             self.prog_label.setText("")
@@ -1732,10 +2070,13 @@ class MainWindow(QMainWindow):
                 state, state_icon = _("копіюється…"), "media-record"
             else:
                 state, state_icon = "", ""
-            item = self.tree.topLevelItem(idx)
+            item = self.tree.topLevelItem(idx) if shown else None
             if item:
                 item.setText(4, state)
                 item.setIcon(4, icon(state_icon) if state_icon else QIcon())
+        if done != self.lib_done:
+            self.lib_done = done
+            self.rescan()
         total = len(i["tracks"])
         if ripping:
             self.progress.setRange(0, total)
@@ -1749,7 +2090,7 @@ class MainWindow(QMainWindow):
 
     def titles_mtime(self):
         """Час зміни файлів із назвами цього диска: введених вручну й мітки в бібліотеці."""
-        i, stamp = self.info, 0.0
+        i, stamp = self.disc, 0.0
         cfg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
         for path in (os.path.join(cfg, APP, "discs", f"{i.get('MB_DISCID', '')}.conf"),
                      os.path.join(i.get("LIBRARY_DIR", ""), ".cd-auto-runner")):
@@ -1761,7 +2102,7 @@ class MainWindow(QMainWindow):
 
     def poll(self):
         # назви змінили не з вікна (сповіщення «Ввести назви…», термінал) — оновити
-        if self.info and not self.loading and self.titles_mtime() != getattr(self, "titles_stamp", 0):
+        if self.disc and not self.loading and self.titles_mtime() != getattr(self, "titles_stamp", 0):
             self.reload_info()
         tracks = udev_audio_tracks()
         if tracks != self.last_tracks:
@@ -1769,9 +2110,13 @@ class MainWindow(QMainWindow):
             if tracks:
                 self.reload_info()
             else:
-                self.stop_playback()
-                self.info = {}
-                self.show_empty()
+                self.disc = {}
+                if self.album_open():
+                    self.fill_library()
+                else:
+                    self.stop_playback()
+                    self.info = {}
+                    self.show_empty()
                 # диск вийнято — кеш змісту диска більше не чинний
                 runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
                 for f in glob.glob(os.path.join(runtime, APP, "toc-*")):
@@ -1840,8 +2185,9 @@ class MainWindow(QMainWindow):
         # без бібліотеки треки копіюються лише для цього вікна — далі копіювати нема сенсу
         if self.cur is not None and read_config().get("LIBRARY", "yes") != "yes" and self.builtin_selected():
             run("stop", timeout=10)
-        self.thread.quit()
-        self.thread.wait(2000)
+        for thread in (self.thread, self.lib_thread):
+            thread.quit()
+            thread.wait(2000)
 
 
 def main():

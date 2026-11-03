@@ -6,7 +6,7 @@
 # Copyright (C) 2026 Pan Vena
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 APP="cd-auto-runner"
 APP_TITLE="CD Auto Runner"
 ICON="media-optical-audio"
@@ -754,6 +754,40 @@ cmd_perm() {
   return 0
 }
 
+# open [-n] [-p ID] ФАЙЛ… → відкрити файли (альбом бібліотеки) в обраному програвачі.
+# Адаптер отримує їх у CDAR_FILES, по одному шляху на рядок.
+cmd_open() {
+  local dry=0 want="" f list="" i adapter
+  local -a files=()
+  while (($#)); do
+    case "$1" in
+      -n|--dry-run) dry=1 ;;
+      -p|--player) want="${2:-}"; shift ;;
+      --player=*) want="${1#*=}" ;;
+      *) files+=("$1") ;;
+    esac
+    shift
+  done
+  ((${#files[@]})) || die "$(_ 'не вказано файлів для відкриття')"
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || die "$(_ 'файл не знайдено: %s' "$f")"
+    f="$(realpath -- "$f")"; list+="${list:+$'\n'}$f"
+  done
+  load_config || true
+  [[ -n "$want" ]] || want="$PLAYER_ID"
+  detect_players
+  i="$(find_player "$want")" || die "$(_ 'цей програвач не може відкрити файли: %s' "${want:-—}")"
+  adapter="${FOUND_ADAPTER[$i]:-$GENERIC_ADAPTER}"
+  [[ -n "$adapter" && -f "$adapter" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено адаптерів (players/). Перевстановіть %s.' "$APP")"
+  local -a env=(
+    "CDAR_LIB=$CDAR_LIB" "CDAR_FILES=$list" "CDAR_EXEC=${FOUND_EXEC[$i]}" "CDAR_DESKTOP_ID=$want"
+    "CDAR_NAME=${FOUND_NAMES[$i]}" "CDAR_FLATPAK=${FOUND_FLATPAK[$i]}" "CDAR_NOTIFY=$NOTIFY" "CDAR_DRY_RUN=$dry"
+    "CDAR_LIBRARY_DIR=$LIBRARY_DIR" "CDAR_UI_LANG=$CDAR_UI_LANG" "CDAR_I18N=$CDAR_I18N" "CDAR_SELF=$SELF"
+  )
+  if ((dry)); then env "${env[@]}" bash "$adapter"; return; fi
+  run_detached "$APP_TITLE: ${FOUND_NAMES[$i]}" env "${env[@]}" bash "$adapter"
+}
+
 # info [ПРИСТРІЙ] → відомості про диск у форматі ключ=значення (для gui.py)
 cmd_info() {
   local dev
@@ -1052,6 +1086,7 @@ usage() {
   play [ПРИСТРІЙ]     запустити програвач для диска (за замовч. — перший аудіо-CD)
       -p, --player ID інша програма (id з «list»), напр. org.kde.elisa.desktop
       -n, --dry-run   лише показати команду
+  open ФАЙЛ…          відкрити файли в обраному програвачі (-p і -n — як у play)
   rip [ПРИСТРІЙ]      скопіювати диск у бібліотеку музики (Виконавець/Альбом), без відтворення
   tag [ПРИСТРІЙ]      ввести назви треків (для дисків, яких немає в MusicBrainz)
   stop                зупинити копіювання треків
@@ -1080,6 +1115,7 @@ main() {
     perm)               cmd_perm "$@" ;;
     info)               cmd_info "$@" ;;
     play)               cmd_play "$@" ;;
+    open)               cmd_open "$@" ;;
     watch|daemon)       cmd_watch ;;
     status)             cmd_status ;;
     list)               cmd_list ;;

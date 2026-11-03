@@ -10,6 +10,8 @@
 # shellcheck source=_lib.sh
 source "$CDAR_LIB"
 
+if cdar_files; then cdar_launch -- "${CDAR_FILE_LIST[@]}"; exit; fi
+
 opt="--cdda-device"
 if [[ -z "$CDAR_FLATPAK" ]] && command -v mpv >/dev/null 2>&1; then
   opts="$(mpv --list-options 2>/dev/null)"

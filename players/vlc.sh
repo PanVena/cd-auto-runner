@@ -13,6 +13,8 @@ source "$CDAR_LIB"
 # «VLC (Audio CD)» має в Exec «cdda://%f» — замінюємо на звичайний список аргументів
 CDAR_EXEC="${CDAR_EXEC/cdda:\/\/%f/%U}"
 
+if cdar_files; then cdar_launch --opt --no-random -- "${CDAR_FILE_LIST[@]}"; exit; fi
+
 meta=0
 if [[ "$CDAR_DRY_RUN" != 1 ]] && CDAR_RIPPER="$(cdar_ripper)" && _cdar_read_toc; then
   _cdar_metadata && meta=1

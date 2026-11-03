@@ -13,6 +13,7 @@ Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
 - Gets track titles from MusicBrainz; for discs that aren't there, lets you enter them yourself.
 - Adds actions to Plasma's **Disks & Devices** menu: play, play in another player, rip, enter titles.
 - App window with the disc, its tracks, playback controls and all settings (PySide6; falls back to `kdialog` or the terminal). It hides to the system tray when closed (an inserted disc can also play straight in the tray, without opening the window), the player has shuffle and repeat, and the built-in player shows up in Plasma's Media Player widget and responds to media keys (MPRIS, needs dbus-python).
+- Works as a regular player too: the **Library** card lists albums you've ripped, and one opens in your chosen player, in place of the inserted disc or with no disc in the drive at all (a custom command can't take files, so with it albums play in the window). Inserting a disc that autoplays takes over from the album.
 - English and Ukrainian interface.
 
 ## Installation
@@ -31,6 +32,7 @@ The installer asks for the language and the player, installs `mpv` (the engine o
 cd-auto-runner settings        the app window (and the built-in player)
 cd-auto-runner choose          choose a player
 cd-auto-runner play [/dev/sr0] start the player manually
+cd-auto-runner open FILE...    open files in the chosen player
 cd-auto-runner rip             rip the disc to the music library without playing
 cd-auto-runner tag             enter track titles
 cd-auto-runner stop            stop ripping

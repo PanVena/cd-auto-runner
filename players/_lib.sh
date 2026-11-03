@@ -35,7 +35,8 @@ else
   _() { local s="$1"; shift; if (($#)); then printf -- "$s" "$@"; else printf '%s' "$s"; fi; }
 fi
 
-: "${CDAR_DEVICE:?}" "${CDAR_EXEC:?}"
+: "${CDAR_EXEC:?}"
+[[ -n "${CDAR_FILES:-}" ]] || : "${CDAR_DEVICE:?}"    # cd-auto-runner open: без приводу
 CDAR_TRACKS="${CDAR_TRACKS:-1}"
 CDAR_NAME="${CDAR_NAME:-player}"
 CDAR_FLATPAK="${CDAR_FLATPAK:-}"
@@ -183,6 +184,13 @@ _cdar_flatpak_reads_all() {
     ((ok)) || return 1
   done
   return 0
+}
+
+# cd-auto-runner open: адаптер відкриває готові файли замість диска.
+# Заповнює CDAR_FILE_LIST; 1 — звичайний запуск для диска.
+cdar_files() {
+  [[ -n "${CDAR_FILES:-}" ]] || return 1
+  mapfile -t CDAR_FILE_LIST <<< "$CDAR_FILES"
 }
 
 # Адреси для кожного треку: cdar_track_urls 'cdda://?' → cdda://?1 … cdda://?N
@@ -793,6 +801,7 @@ _cdar_fail() {
 cdar_rip_and_play() {
   local open_fn="$1" dir base t fmt rc lib="" stem
   CDAR_MODE="${2:-play}"
+  if cdar_files; then "$open_fn" "${CDAR_FILE_LIST[@]}"; return; fi
   if ! CDAR_RIPPER="$(cdar_ripper)"; then
     cdar_notify "$(_ 'Не можу скопіювати треки')" "$(_ 'Встановіть cd-paranoia (пакет libcdio-paranoia) або cdparanoia.')"
     cdar_log "$(_ 'не знайдено cd-paranoia/cdparanoia')"; return 1
