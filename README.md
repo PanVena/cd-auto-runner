@@ -33,7 +33,7 @@ Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
 ## Installation
 
 ```bash
-git clone https://github.com/<your-login>/cd-auto-runner.git
+git clone https://github.com/PanVena/cd-auto-runner.git
 cd cd-auto-runner
 ./install.sh
 ```
