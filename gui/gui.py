@@ -823,6 +823,17 @@ def section(title):
     return box, form
 
 
+class Combo(QComboBox):
+    """Коліщатко прокручує сторінку налаштувань, а не перемикає значення під курсором."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class MainWindow(QMainWindow):
     COVER = 168
     request_info = Signal()     # виклик InfoWorker.load у фоновому потоці (queued)
@@ -860,6 +871,7 @@ class MainWindow(QMainWindow):
         self.mpris = None
         self.tray = None
         self.quitting = False       # «Вийти»: закриття вікна завершує програму, а не ховає її
+        self.restart_lang = None    # мову змінено: main() перезапустить програму з новою мовою
         self.shut_down = False
         self.pending_play = play    # відтворити, щойно прочитано диск
         self.rip_started = 0.0
@@ -1441,7 +1453,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(12)
 
         g1, f1 = section(_("Відтворення"))
-        self.player = QComboBox()
+        self.player = Combo()
         self.player.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.player.setMinimumContentsLength(18)
         self.player.activated.connect(self.on_player)
@@ -1455,7 +1467,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(g1)
 
         g2, f2 = section(_("Копіювання і бібліотека"))
-        self.fmt = QComboBox()
+        self.fmt = Combo()
         for key, text in (("flac", "FLAC — без втрат"), ("opus", "Opus 160 кбіт/с — малий розмір"),
                           ("ogg", "Ogg Vorbis q6"), ("mp3", "MP3 VBR ~190 кбіт/с"),
                           ("wav", "WAV — без перекодування")):
@@ -1488,7 +1500,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(g2)
 
         g3, f3 = section(_("Інтерфейс"))
-        self.lang = QComboBox()
+        self.lang = Combo()
         self.lang.addItem("English", "en")
         self.lang.addItem("Українська", "uk")
         self.lang.setCurrentIndex(self.lang.findData(LANG))
@@ -1809,8 +1821,7 @@ class MainWindow(QMainWindow):
         if self.mpris:              # звільняємо ім'я MPRIS для нового вікна
             self.mpris.remove_from_connection()
             self.mpris = None
-        env = dict(os.environ, CDAR_UI_LANG=lang)
-        subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__)], env=env, start_new_session=True)
+        self.restart_lang = lang    # main() перезапустить програму після виходу з циклу подій
         QApplication.quit()
 
     def update_service(self):
@@ -2229,7 +2240,12 @@ def main():
     win.listen(server)
     if not (play and win.play_in_tray()):
         win.show()
-    return app.exec()
+    code = app.exec()
+    if win.restart_lang:
+        # exec, а не дочірній процес: той лишився б у cgroup юніта systemd і помер би разом зі старим
+        env = dict(os.environ, CDAR_UI_LANG=win.restart_lang)
+        os.execve(sys.executable, [sys.executable, "-I", os.path.abspath(__file__)], env)
+    return code
 
 
 if __name__ == "__main__":
