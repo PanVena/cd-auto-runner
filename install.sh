@@ -176,6 +176,7 @@ declare -A OPT_DESC=(
   [cd-paranoia]="$(_ 'копіювання треків для Elisa, QMPlay2, Audacious і бібліотеки музики')"
   [ffmpeg]="$(_ 'кодування треків у FLAC/Opus/MP3 для бібліотеки музики')"
   [pyside6]="$(_ 'вікно програми, вбудований програвач і форма для введення назв треків')"
+  [dbus-python]="$(_ 'вбудований програвач у віджеті «Програвач» і на мультимедійних клавішах (MPRIS)')"
 )
 declare -A OPT_PKG=(  # dnf apt pacman zypper
   [kdialog]="kdialog kdialog kdialog kdialog"
@@ -183,15 +184,17 @@ declare -A OPT_PKG=(  # dnf apt pacman zypper
   [cd-paranoia]="libcdio-paranoia cdparanoia cdparanoia cdparanoia"
   [ffmpeg]="ffmpeg-free ffmpeg ffmpeg ffmpeg"
   [pyside6]="python3-pyside6 python3-pyside6.qtwidgets pyside6 python3-pyside6"
+  [dbus-python]="python3-dbus python3-dbus python-dbus python3-dbus-python"
 )
 has_tool() {
   case "$1" in
     cd-paranoia) have cd-paranoia || have cdparanoia ;;
     pyside6) python3 -c 'import PySide6.QtWidgets' 2>/dev/null ;;
+    dbus-python) python3 -c 'import dbus.mainloop.glib' 2>/dev/null ;;
     *) have "$1" ;;
   esac
 }
-for tool in kdialog notify-send cd-paranoia ffmpeg pyside6; do
+for tool in kdialog notify-send cd-paranoia ffmpeg pyside6 dbus-python; do
   if has_tool "$tool"; then ok "$(_ '%s: є' "$tool")"; continue; fi
   warn "$(_ '%s не встановлено — %s' "$tool" "${OPT_DESC[$tool]}")"
   ((SKIP_DEPS)) && continue
@@ -252,7 +255,7 @@ step "$(_ 'Вибір програвача')"
 if [[ "$CHOOSE" == auto ]]; then
   if grep -q '^PLAYER_ID=.' "$CFG" 2>/dev/null; then
     ok "$(_ 'Поточний вибір: %s' "$(grep '^PLAYER_NAME=' "$CFG" | cut -d= -f2-)")"
-    if ask "$(_ 'Обрати інший програвач?')" n; then CHOOSE=yes; else CHOOSE=no; fi
+    if ask "$(_ 'Залишити цей програвач?')" y; then CHOOSE=no; else CHOOSE=yes; fi
   else
     CHOOSE=yes
   fi

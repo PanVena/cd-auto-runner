@@ -670,8 +670,9 @@ _cdar_mpris_track() {
         fi
       done
     fi
+  # cd_auto_runner — вбудований програвач (вікно): він сам каже, який трек копіювати (.want)
   done < <(busctl --user list --no-legend 2>/dev/null | awk '{print $1}' \
-             | grep '^org\.mpris\.MediaPlayer2\.' | grep -v playerctld)
+             | grep '^org\.mpris\.MediaPlayer2\.' | grep -v -e playerctld -e cd_auto_runner)
   return 1
 }
 

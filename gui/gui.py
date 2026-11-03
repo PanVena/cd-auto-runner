@@ -3,12 +3,15 @@
 
 Вікно показує стан і викликає cd-auto-runner (CDAR_SELF): уся логіка копіювання — у скрипті.
 Вбудований програвач відтворює скопійовані треки через mpv (окремий процес, керування —
-JSON IPC через локальний сокет). Тексти українською; EN — англійський переклад (CDAR_UI_LANG).
+JSON IPC через локальний сокет) і показує себе системі через MPRIS (віджет «Програвач»,
+мультимедійні клавіші); вікно згортається в системний лоток. Тексти українською;
+EN — англійський переклад (CDAR_UI_LANG).
 
   gui.py [--play] [ПРИСТРІЙ]   --play — одразу відтворювати диск у вбудованому програвачі
 
 CD Auto Runner main window. Ripping logic lives in the cd-auto-runner script; the built-in
-player plays ripped tracks through mpv, controlled over its JSON IPC socket.
+player plays ripped tracks through mpv, controlled over its JSON IPC socket, and is exposed
+to the desktop over MPRIS; the window hides to the system tray.
 
 SPDX-License-Identifier: GPL-2.0-only
 Copyright (C) 2026 Pan Vena
@@ -16,6 +19,7 @@ Copyright (C) 2026 Pan Vena
 import glob
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -27,10 +31,18 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSlider, QSplitter, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QSlider, QSplitter, QSystemTrayIcon, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+try:    # MPRIS — необов'язково: без dbus-python програвач просто не видно у віджеті «Програвач»
+    import dbus
+    import dbus.service
+    from dbus.mainloop.glib import DBusGMainLoop
+except ImportError:
+    dbus = None
+
 APP = "cd-auto-runner"
+HOMEPAGE = "https://github.com/PanVena/cd-auto-runner"
 LANG = os.environ.get("CDAR_UI_LANG", "uk")
 
 EN = {
@@ -110,6 +122,27 @@ EN = {
     "Для вбудованого програвача встановіть mpv (пакет mpv).": "Install mpv (the mpv package) to use the built-in player.",
     "Не вдалося запустити mpv.": "Failed to start mpv.",
     "Не вдалося відтворити трек {n}.": "Failed to play track {n}.",
+    "Згортати в системний лоток під час закриття вікна": "Hide to the system tray when the window is closed",
+    "Показати / сховати вікно": "Show / hide the window",
+    "Вийти": "Quit",
+    "CD Auto Runner працює далі в системному лотку. Щоб вийти, оберіть «Вийти» в меню його значка.":
+        "CD Auto Runner keeps running in the system tray. To quit, choose \"Quit\" in its icon menu.",
+    "Трек {n}": "Track {n}",
+    "Перемішувати": "Shuffle",
+    "Повтор: вимкнено": "Repeat: off",
+    "Повтор: увесь диск": "Repeat: whole disc",
+    "Повтор: один трек": "Repeat: one track",
+    "Вставлений диск відтворювати у лотку, не відкриваючи вікна": "Play an inserted disc in the tray without opening the window",
+    "Вийняти диск": "Eject the disc",
+    "Не вдалося вийняти диск.": "Failed to eject the disc.",
+    "Аудіо-CD": "Audio CD",
+    "Про програму": "About",
+    "Версія {v}": "Version {v}",
+    "Запускає обраний програвач, щойно вставлено аудіо-CD, має власний вбудований програвач і копіює диски в бібліотеку музики з назвами треків і обкладинками.":
+        "Starts the player of your choice as soon as an audio CD is inserted, has its own built-in player and rips discs to your music library with track titles and cover art.",
+    "Ліцензія: GNU GPL версії 2.": "License: GNU GPL version 2.",
+    "Відтворюю диск. Керувати ним можна зі значка в лотку або з віджета «Програвач».":
+        "Playing the disc. Control it from the tray icon or the Media Player widget.",
 }
 
 
@@ -218,6 +251,13 @@ def is_dark(pal):
 
 AUDIO_EXT = {".flac", ".opus", ".ogg", ".mp3", ".wav"}
 
+# режими повтору (як LoopStatus у MPRIS): значок і підказка; кнопка перемикає їх по колу
+LOOP_MODES = {
+    "None": ("media-playlist-repeat", "Повтор: вимкнено"),
+    "Playlist": ("media-playlist-repeat", "Повтор: увесь диск"),
+    "Track": ("media-playlist-repeat-song", "Повтор: один трек"),
+}
+
 
 # --- рушій вбудованого програвача: mpv у фоні, керування через JSON IPC --------------
 class Mpv(QObject):
@@ -261,6 +301,8 @@ class Mpv(QObject):
             # перекриваємо налаштування mpv.conf, що заважали б переходу на наступний трек
             "--keep-open=no", "--loop-file=no", "--loop-playlist=no", "--resume-playback=no",
             "--save-position-on-quit=no",
+            # без скриптів (зокрема mpv-mpris): у системі програвач показує саме вікно (Mpris)
+            "--load-scripts=no",
             f"--volume={self.volume}", f"--input-ipc-server={self.path}",
         ])
         self.proc.setProcessChannelMode(QProcess.ForwardedErrorChannel)
@@ -370,6 +412,207 @@ class Mpv(QObject):
             pass
 
 
+# --- MPRIS: вбудований програвач у віджеті «Програвач» і на мультимедійних клавішах -----
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_ROOT = "org.mpris.MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+DBUS_PROPS = "org.freedesktop.DBus.Properties"
+NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+
+def start_mpris(win):
+    """Сервіс MPRIS у циклі подій вікна. dbus-python працює в циклі GLib, тож лише тоді,
+    коли Qt сам крутить цикл GLib (типово в Linux; QT_NO_GLIB=1 його вимикає)."""
+    dispatcher = QApplication.instance().eventDispatcher()
+    # QEventDispatcherGlib, QPAEventDispatcherGlib (Wayland), QXcbGlibEventDispatcher (X11)
+    if dbus is None or dispatcher is None or "Glib" not in dispatcher.metaObject().className():
+        return None
+    try:
+        DBusGMainLoop(set_as_default=True)
+        bus = dbus.SessionBus()
+        name = dbus.service.BusName(f"{MPRIS_ROOT}.cd_auto_runner", bus)
+        return Mpris(win, bus, name)
+    except dbus.exceptions.DBusException:
+        return None
+
+
+if dbus is not None:
+    def _strings(*items):
+        return dbus.Array([i for i in items if i], signature="s")
+
+    class Mpris(dbus.service.Object):
+        """org.mpris.MediaPlayer2 і .Player для вбудованого програвача. Стан бере з вікна,
+        команди передає йому; виклики приходять у головному потоці (цикл GLib = цикл Qt)."""
+
+        def __init__(self, win, bus, name):
+            super().__init__(bus, MPRIS_PATH)
+            self.win = win
+            self.bus_name = name        # ім'я на шині тримається, доки живе цей об'єкт
+            self.last = {}
+
+        # --- стан ---
+        def track_id(self, n):
+            return dbus.ObjectPath(f"/org/cd_auto_runner/track/{n}")
+
+        def metadata(self):
+            w = self.win
+            n = w.cur
+            if n is None:
+                return dbus.Dictionary({"mpris:trackid": dbus.ObjectPath(NO_TRACK)}, signature="sv")
+            t = w.track_title(n) or {}
+            info = w.info
+            meta = {"mpris:trackid": self.track_id(n), "xesam:trackNumber": dbus.Int32(n),
+                    "xesam:title": dbus.String(t.get("title") or _("Трек {n}", n=n))}
+            sec = w.length if w.want is None and w.length > 0 else t.get("sec", 0)
+            if sec:
+                meta["mpris:length"] = dbus.Int64(int(sec * 1_000_000))
+            if t.get("artist") or info.get("ALBUM_ARTIST"):
+                meta["xesam:artist"] = _strings(t.get("artist") or info.get("ALBUM_ARTIST"))
+            if info.get("ALBUM_ARTIST"):
+                meta["xesam:albumArtist"] = _strings(info["ALBUM_ARTIST"])
+            if info.get("ALBUM"):
+                meta["xesam:album"] = dbus.String(info["ALBUM"])
+            if info.get("COVER") and os.path.isfile(info["COVER"]):
+                meta["mpris:artUrl"] = dbus.String(bytes(QUrl.fromLocalFile(info["COVER"]).toEncoded()).decode())
+            return dbus.Dictionary(meta, signature="sv")
+
+        def player_props(self):
+            w = self.win
+            n = w.cur
+            tracks = len(w.info.get("tracks", []))
+            if n is None:
+                status = "Stopped"
+            elif w.is_paused and w.want is None:
+                status = "Paused"
+            else:
+                status = "Playing"      # грає або чекає, поки скопіюється трек
+            ready = w.mpv is not None and tracks > 0
+            playing = n is not None and w.want is None
+            return {
+                "PlaybackStatus": dbus.String(status),
+                "Rate": dbus.Double(1.0), "MinimumRate": dbus.Double(1.0), "MaximumRate": dbus.Double(1.0),
+                "Metadata": self.metadata(),
+                "Volume": dbus.Double(w.vol.value() / 100),
+                "Position": dbus.Int64(int(w.pos * 1_000_000) if playing else 0),
+                "LoopStatus": dbus.String(w.loop), "Shuffle": dbus.Boolean(w.shuffle),
+                "CanGoNext": dbus.Boolean(w.neighbor(1) is not None),
+                "CanGoPrevious": dbus.Boolean(n is not None),
+                "CanPlay": dbus.Boolean(ready), "CanPause": dbus.Boolean(ready),
+                "CanSeek": dbus.Boolean(playing), "CanControl": dbus.Boolean(True),
+            }
+
+        def root_props(self):
+            return {
+                "CanQuit": dbus.Boolean(True), "CanRaise": dbus.Boolean(True),
+                "HasTrackList": dbus.Boolean(False), "Identity": dbus.String("CD Auto Runner"),
+                "DesktopEntry": dbus.String(APP),
+                "SupportedUriSchemes": _strings(), "SupportedMimeTypes": _strings(),
+            }
+
+        def refresh(self):
+            """Сповіщає клієнтів про змінені властивості (позицію вони рахують самі)."""
+            props = self.player_props()
+            del props["Position"]
+            changed = {k: v for k, v in props.items() if self.last.get(k) != v}
+            self.last = props
+            if changed:
+                self.PropertiesChanged(MPRIS_PLAYER, dbus.Dictionary(changed, signature="sv"), _strings())
+
+        # --- org.freedesktop.DBus.Properties ---
+        @dbus.service.method(DBUS_PROPS, in_signature="ss", out_signature="v")
+        def Get(self, iface, prop):
+            props = self.GetAll(iface)
+            if prop not in props:
+                raise dbus.exceptions.DBusException(f"No such property: {prop}",
+                                                    name="org.freedesktop.DBus.Error.UnknownProperty")
+            return props[prop]
+
+        @dbus.service.method(DBUS_PROPS, in_signature="s", out_signature="a{sv}")
+        def GetAll(self, iface):
+            if iface == MPRIS_ROOT:
+                return self.root_props()
+            if iface == MPRIS_PLAYER:
+                return self.player_props()
+            raise dbus.exceptions.DBusException(f"No such interface: {iface}",
+                                                name="org.freedesktop.DBus.Error.UnknownInterface")
+
+        @dbus.service.method(DBUS_PROPS, in_signature="ssv")
+        def Set(self, iface, prop, value):
+            if iface == MPRIS_PLAYER and prop == "Volume":
+                self.win.vol.setValue(round(max(0.0, min(1.0, float(value))) * 100))
+            elif iface == MPRIS_PLAYER and prop == "LoopStatus" and str(value) in LOOP_MODES:
+                self.win.set_loop(str(value))
+            elif iface == MPRIS_PLAYER and prop == "Shuffle":
+                self.win.set_shuffle(bool(value))
+            else:
+                raise dbus.exceptions.DBusException(f"Read-only property: {prop}",
+                                                    name="org.freedesktop.DBus.Error.PropertyReadOnly")
+
+        @dbus.service.signal(DBUS_PROPS, signature="sa{sv}as")
+        def PropertiesChanged(self, iface, changed, invalidated):
+            pass
+
+        # --- org.mpris.MediaPlayer2 ---
+        @dbus.service.method(MPRIS_ROOT)
+        def Raise(self):
+            self.win.show_window()
+
+        @dbus.service.method(MPRIS_ROOT)
+        def Quit(self):
+            self.win.quit_app()
+
+        # --- org.mpris.MediaPlayer2.Player ---
+        @dbus.service.method(MPRIS_PLAYER)
+        def Next(self):
+            self.win.next_track()
+
+        @dbus.service.method(MPRIS_PLAYER)
+        def Previous(self):
+            self.win.prev_track()
+
+        @dbus.service.method(MPRIS_PLAYER)
+        def Pause(self):
+            w = self.win
+            if w.cur is not None and w.want is None and not w.is_paused:
+                w.mpv.toggle()
+
+        @dbus.service.method(MPRIS_PLAYER)
+        def Play(self):
+            w = self.win
+            if w.cur is None:
+                w.toggle_play()
+            elif w.want is None and w.is_paused:
+                w.mpv.toggle()
+
+        @dbus.service.method(MPRIS_PLAYER)
+        def PlayPause(self):
+            self.win.toggle_play()
+
+        @dbus.service.method(MPRIS_PLAYER)
+        def Stop(self):
+            self.win.stop_playback()
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="x")
+        def Seek(self, offset):
+            w = self.win
+            if w.cur is not None and w.want is None:
+                w.seek_to(w.pos + offset / 1_000_000)
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="ox")
+        def SetPosition(self, track_id, position):
+            w = self.win
+            if w.cur is not None and w.want is None and track_id == self.track_id(w.cur) and position >= 0:
+                w.seek_to(position / 1_000_000)
+
+        @dbus.service.method(MPRIS_PLAYER, in_signature="s")
+        def OpenUri(self, _uri):
+            pass
+
+        @dbus.service.signal(MPRIS_PLAYER, signature="x")
+        def Seeked(self, position):
+            pass
+
+
 # --- фонове завантаження відомостей про диск ------------------------------------------
 class InfoWorker(QObject):
     done = Signal(dict)
@@ -431,7 +674,18 @@ class MainWindow(QMainWindow):
         self.want = None            # трек, який ще копіюється — відтворимо, щойно буде готовий
         self.is_paused = False
         self.length = 0.0
+        self.pos = 0.0
         self.seeking = False
+        gui = QSettings(APP, "gui")
+        self.loop = gui.value("loop", "None")            # MPRIS LoopStatus: None | Playlist | Track
+        if self.loop not in LOOP_MODES:
+            self.loop = "None"
+        self.shuffle = gui.value("shuffle", "false") == "true"
+        self.order = []             # порядок треків (перемішаний, якщо ввімкнено «Перемішувати»)
+        self.mpris = None
+        self.tray = None
+        self.quitting = False       # «Вийти»: закриття вікна завершує програму, а не ховає її
+        self.shut_down = False
         self.pending_play = play    # відтворити, щойно прочитано диск
         self.rip_started = 0.0
 
@@ -459,7 +713,7 @@ class MainWindow(QMainWindow):
         outer.setSpacing(12)
         outer.addWidget(self.build_header())
 
-        split = QSplitter(Qt.Horizontal)
+        self.split = split = QSplitter(Qt.Horizontal)
         left = QWidget()
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
@@ -476,6 +730,11 @@ class MainWindow(QMainWindow):
 
         self.build_statusbar()
         self.load_settings()
+        self.build_tray()
+        self.restore_layout()
+        if self.mpv:
+            self.mpris = start_mpris(self)
+            self.update_player()
 
         self.thread = QThread(self)
         self.worker = InfoWorker()
@@ -554,9 +813,12 @@ class MainWindow(QMainWindow):
         self.act_mb = menu.addAction(QIcon.fromTheme("internet-web-browser"), _("Додати диск у MusicBrainz"),
                                      lambda: QDesktopServices.openUrl(QUrl(self.info.get("MB_URL", ""))))
         menu.addSeparator()
+        self.act_eject = menu.addAction(icon("media-eject"), _("Вийняти диск"), self.eject)
         menu.addAction(icon("view-refresh"), _("Оновити"), self.reload_info)
         menu.addAction(icon("edit-clear-history"), _("Видалити тимчасові файли"),
                        lambda: self.action("clean"))
+        menu.addSeparator()
+        menu.addAction(icon("help-about"), _("Про програму"), self.about)
         more.setMenu(menu)
         buttons.addStretch(1)
         buttons.addWidget(more)
@@ -610,6 +872,11 @@ class MainWindow(QMainWindow):
         self.p_stop = tool("media-playback-stop", _("Зупинити відтворення"), self.stop_playback)
         self.p_next = tool("media-skip-forward", _("Наступний трек"), self.next_track)
         self.p_play.setIconSize(QSize(28, 28))
+        row.addSpacing(4)
+        self.p_shuffle = tool("media-playlist-shuffle", _("Перемішувати"), lambda: self.set_shuffle(not self.shuffle))
+        self.p_loop = tool("media-playlist-repeat", "", self.cycle_loop)
+        for b in (self.p_shuffle, self.p_loop):
+            b.setCheckable(True)
         row.addSpacing(8)
         self.now = QLabel()
         self.now.setTextFormat(Qt.PlainText)
@@ -719,6 +986,7 @@ class MainWindow(QMainWindow):
         if not self.mpv or not tracks or not 1 <= n <= len(tracks):
             return
         self.cur = n
+        self.pos = 0.0
         path = self.track_file(n)
         if path:
             self.want = None
@@ -748,27 +1016,76 @@ class MainWindow(QMainWindow):
             return
         if self.cur is None:
             sel = self.tree.currentItem()
-            self.play_track(self.tree.indexOfTopLevelItem(sel) + 1 if sel else 1)
+            self.play_track(self.tree.indexOfTopLevelItem(sel) + 1 if sel else self.first_track())
         elif self.want is None:
             self.mpv.toggle()
+
+    # --- порядок відтворення: перемішування і повтор ---
+    def play_order(self):
+        n = len(self.info.get("tracks", []))
+        if sorted(self.order) != list(range(1, n + 1)):
+            self.order = self.new_order(n)
+        return self.order
+
+    def new_order(self, n):
+        order = list(range(1, n + 1))
+        if self.shuffle:
+            random.shuffle(order)
+            if self.cur in order:           # поточний трек — першим, щоб «далі» не повторювало вже чуте
+                order.remove(self.cur)
+                order.insert(0, self.cur)
+        return order
+
+    def neighbor(self, step):
+        """Трек, що йде за поточним (step=1) або перед ним (step=-1), з урахуванням повтору диска."""
+        order = self.play_order()
+        if self.cur is None or self.cur not in order:
+            return None
+        i = order.index(self.cur) + step
+        if 0 <= i < len(order):
+            return order[i]
+        return order[i % len(order)] if self.loop == "Playlist" else None
+
+    def set_shuffle(self, on):
+        self.shuffle = bool(on)
+        QSettings(APP, "gui").setValue("shuffle", "true" if self.shuffle else "false")
+        self.order = self.new_order(len(self.info.get("tracks", [])))
+        self.update_player()
+
+    def set_loop(self, mode):
+        if mode in LOOP_MODES:
+            self.loop = mode
+            QSettings(APP, "gui").setValue("loop", mode)
+            self.update_player()
+
+    def cycle_loop(self):
+        modes = list(LOOP_MODES)
+        self.set_loop(modes[(modes.index(self.loop) + 1) % len(modes)])
+
+    def first_track(self):
+        order = self.play_order()
+        return order[0] if order else 1
 
     def prev_track(self):
         if self.cur is None:
             return
         if self.want is None and self.seek.value() > 3:
-            self.mpv.seek(0)
-        elif self.cur > 1:
-            self.play_track(self.cur - 1)
+            self.seek_to(0)
+        else:
+            n = self.neighbor(-1)
+            if n is not None:
+                self.play_track(n)
 
     def next_track(self):
-        if self.cur is not None and self.cur < len(self.info.get("tracks", [])):
-            self.play_track(self.cur + 1)
+        n = self.neighbor(1)
+        if n is not None:
+            self.play_track(n)
 
     def on_play(self):
         """Кнопка «Відтворити»: вбудований програвач — у цьому вікні, інакше — обраний програвач."""
         if self.builtin_selected() and self.mpv:
             if self.cur is None:
-                self.play_track(1)
+                self.play_track(self.first_track())
             elif self.is_paused:
                 self.mpv.toggle()
         else:
@@ -785,11 +1102,27 @@ class MainWindow(QMainWindow):
         if self.info.get("tracks") and not self.loading:
             self.pending_play = False
             if self.cur is None:
-                self.play_track(1)
+                self.play_track(self.first_track())
+                if not self.isVisible():
+                    self.announce_play()
         else:
             self.pending_play = True
 
+    def seek_to(self, sec):
+        if not self.mpv or self.cur is None or self.want is not None:
+            return
+        sec = max(0.0, sec)
+        if self.length and sec >= self.length:
+            self.next_track()
+            return
+        self.mpv.seek(sec)
+        self.pos = sec
+        self.on_position(sec)
+        if self.mpris:
+            self.mpris.Seeked(dbus.Int64(int(sec * 1_000_000)))
+
     def on_position(self, sec):
+        self.pos = sec
         if not self.seeking:
             self.seek.setValue(int(sec))
         self.t_pos.setText(fmt_time(sec))
@@ -798,6 +1131,8 @@ class MainWindow(QMainWindow):
         self.length = sec
         self.seek.setRange(0, int(sec))
         self.t_len.setText(fmt_time(sec))
+        if self.mpris:
+            self.mpris.refresh()
 
     def on_paused(self, paused):
         self.is_paused = paused
@@ -805,18 +1140,20 @@ class MainWindow(QMainWindow):
 
     def on_seek(self):
         self.seeking = False
-        if self.mpv and self.cur is not None and self.want is None:
-            self.mpv.seek(self.seek.value())
+        self.seek_to(self.seek.value())
 
     def on_volume(self, value):
         QSettings(APP, "gui").setValue("volume", value)
         if self.mpv:
             self.mpv.set_volume(value)
+        if self.mpris:
+            self.mpris.refresh()
 
     def on_ended(self, reason):
         if reason == "eof" and self.cur is not None and self.want is None:
-            if self.cur < len(self.info.get("tracks", [])):
-                self.play_track(self.cur + 1)
+            n = self.cur if self.loop == "Track" else self.neighbor(1)
+            if n is not None:
+                self.play_track(n)
             else:
                 self.stop_playback()
         elif reason == "error" and self.cur is not None:
@@ -834,6 +1171,13 @@ class MainWindow(QMainWindow):
         for b in (self.p_prev, self.p_play, self.p_stop, self.p_next, self.seek):
             b.setEnabled(on)
         self.vol.setEnabled(self.mpv is not None)
+        self.p_shuffle.setEnabled(self.mpv is not None)
+        self.p_loop.setEnabled(self.mpv is not None)
+        self.p_shuffle.setChecked(self.shuffle)
+        loop_icon, loop_tip = LOOP_MODES[self.loop]
+        self.p_loop.setChecked(self.loop != "None")
+        self.p_loop.setIcon(icon(loop_icon))
+        self.p_loop.setToolTip(_(loop_tip))
         playing = self.cur is not None and self.want is None and not self.is_paused
         self.p_play.setIcon(icon("media-playback-pause" if playing else "media-playback-start"))
         if not self.mpv:
@@ -851,6 +1195,10 @@ class MainWindow(QMainWindow):
                 text += f"  ({_('Пауза')})"
             self.now.setText(text)
         self.mark_playing()
+        if self.tray:
+            self.tray.setToolTip(f"CD Auto Runner\n{self.now.text()}")
+        if self.mpris:
+            self.mpris.refresh()
 
     def mark_playing(self):
         bold = QFont(self.tree.font())
@@ -935,6 +1283,16 @@ class MainWindow(QMainWindow):
         self.lang.setCurrentIndex(self.lang.findData(LANG))
         self.lang.activated.connect(self.on_lang)
         f3.addRow(_("Мова:"), self.lang)
+        self.chk_tray = QCheckBox(_("Згортати в системний лоток під час закриття вікна"))
+        self.chk_tray.setChecked(QSettings(APP, "gui").value("tray", "true") in (True, "true"))
+        self.chk_tray.setEnabled(QSystemTrayIcon.isSystemTrayAvailable())
+        self.chk_tray.clicked.connect(self.on_tray_option)
+        f3.addRow(self.chk_tray)
+        self.chk_quiet = QCheckBox(_("Вставлений диск відтворювати у лотку, не відкриваючи вікна"))
+        self.chk_quiet.setChecked(QSettings(APP, "gui").value("play_in_tray", "false") == "true")
+        self.chk_quiet.setEnabled(self.chk_tray.isEnabled() and self.chk_tray.isChecked())
+        self.chk_quiet.clicked.connect(lambda v: QSettings(APP, "gui").setValue("play_in_tray", "true" if v else "false"))
+        f3.addRow(self.chk_quiet)
         lay.addWidget(g3)
         lay.addStretch(1)
         area.setWidget(inner)
@@ -955,7 +1313,8 @@ class MainWindow(QMainWindow):
         sb.addWidget(QLabel("   "))
         sb.addWidget(self.prog_label, 1)
         sb.addPermanentWidget(self.progress)
-        footer = QLabel(f"CD Auto Runner {script_version()}")
+        self.version = script_version()
+        footer = QLabel(f"CD Auto Runner {self.version}")
         footer.setObjectName("muted")
         sb.addPermanentWidget(footer)
 
@@ -1032,16 +1391,96 @@ class MainWindow(QMainWindow):
         run("enable" if checked else "disable")
         self.update_service()
 
+    # --- системний лоток ----------------------------------------------------------------
+    def build_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(QIcon.fromTheme("media-optical-audio"), self)
+        self.tray.setToolTip("CD Auto Runner")
+        menu = QMenu(self)
+        menu.addAction(QIcon.fromTheme("media-optical-audio"), _("Показати / сховати вікно"), self.toggle_window)
+        menu.addSeparator()
+        self.tray_play = [
+            menu.addAction(icon("media-playback-start"), _("Відтворити / пауза"), self.toggle_play),
+            menu.addAction(icon("media-skip-backward"), _("Попередній трек"), self.prev_track),
+            menu.addAction(icon("media-skip-forward"), _("Наступний трек"), self.next_track),
+            menu.addAction(icon("media-playback-stop"), _("Зупинити відтворення"), self.stop_playback),
+        ]
+        menu.addSeparator()
+        self.tray_eject = menu.addAction(icon("media-eject"), _("Вийняти диск"), self.eject)
+        menu.addAction(icon("help-about"), _("Про програму"), self.about)
+        menu.addAction(icon("application-exit"), _("Вийти"), self.quit_app)
+        menu.aboutToShow.connect(self.update_tray_menu)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.on_tray_activated)
+        self.tray.messageClicked.connect(self.show_window)
+        self.tray.setVisible(self.chk_tray.isChecked())
+
+    def announce_play(self):
+        """Диск почав грати, а вікна не видно — сповіщення від значка в лотку (клік відкриває вікно)."""
+        if not self.tray_enabled() or read_config().get("NOTIFY", "yes") == "no":
+            return
+        i = self.info
+        title = " — ".join(x for x in (i.get("ALBUM_ARTIST", ""), i.get("ALBUM", "")) if x) or _("Аудіо-CD")
+        cover = QPixmap(i["COVER"]) if i.get("COVER") else QPixmap()
+        tray_icon = QIcon(rounded_pixmap(cover, 128)) if not cover.isNull() else QIcon.fromTheme("media-optical-audio")
+        self.tray.showMessage(title, _("Відтворюю диск. Керувати ним можна зі значка в лотку або з віджета «Програвач»."),
+                              tray_icon, 8000)
+
+    def update_tray_menu(self):
+        for a in self.tray_play:
+            a.setEnabled(self.p_play.isEnabled())
+        self.tray_eject.setEnabled(self.last_tracks > 0)
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.Trigger:
+            self.toggle_window()
+        elif reason == QSystemTrayIcon.MiddleClick:
+            self.toggle_play()
+
+    def on_tray_option(self, checked):
+        QSettings(APP, "gui").setValue("tray", "true" if checked else "false")
+        self.chk_quiet.setEnabled(checked)
+        if self.tray:
+            self.tray.setVisible(checked)
+
+    def tray_enabled(self):
+        return self.tray is not None and self.tray.isVisible()
+
+    def play_in_tray(self):
+        """Диск вставлено — грати, не відкриваючи вікна (якщо так налаштовано)."""
+        return self.tray_enabled() and self.chk_quiet.isChecked()
+
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def toggle_window(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.show_window()
+
+    def quit_app(self):
+        self.quitting = True
+        self.close()
+
     def on_lang(self, _index):
         lang = self.lang.currentData()
         if lang == LANG:
             return
         run("lang", lang)
+        self.save_layout()          # нове вікно відкриється такого ж розміру
         # нове вікно не має застати старе (інакше лише передасть йому «show» і закриється)
         if self.server:
             self.server.close()
         if self.mpv:
             self.mpv.quit()
+        self.cur = None             # копіювання хай триває — для нового вікна
+        if self.mpris:              # звільняємо ім'я MPRIS для нового вікна
+            self.mpris.remove_from_connection()
+            self.mpris = None
         env = dict(os.environ, CDAR_UI_LANG=lang)
         subprocess.Popen([sys.executable, "-I", os.path.abspath(__file__)], env=env, start_new_session=True)
         QApplication.quit()
@@ -1092,6 +1531,54 @@ class MainWindow(QMainWindow):
         else:
             self.proc = proc
 
+    def eject(self):
+        """Зупиняє копіювання (воно тримає привід) і виймає диск. Решту — вийнятий диск,
+        кінець відтворення — зробить poll(), як і тоді, коли диск виймають кнопкою приводу."""
+        dev = self.info.get("DEVICE") or "/dev/sr0"
+        self.stop_playback()
+        self.write_want(None)
+        run("stop", timeout=10)
+        proc = QProcess(self)
+
+        def finished(code, _status):
+            if code:
+                text = bytes(proc.readAllStandardError()).decode(errors="replace").strip()
+                QMessageBox.warning(self, _("Помилка"), text or _("Не вдалося вийняти диск."))
+            self.poll()
+        proc.finished.connect(finished)
+        proc.errorOccurred.connect(lambda err: err == QProcess.FailedToStart and finished(1, None))
+        proc.start("eject", [dev])
+
+    def about(self):
+        if not self.isVisible():        # з меню лотка: вікно діалогу без батьківського не видно
+            self.show_window()
+        box = QMessageBox(self)
+        box.setWindowTitle(_("Про програму"))
+        box.setIconPixmap(QIcon.fromTheme("media-optical-audio").pixmap(64, 64))
+        box.setTextFormat(Qt.RichText)
+        box.setText(f"<h3>CD Auto Runner</h3><p>{_('Версія {v}', v=self.version or '—')}</p>")
+        box.setInformativeText(
+            f"<p>{_('Запускає обраний програвач, щойно вставлено аудіо-CD, має власний вбудований програвач і копіює диски в бібліотеку музики з назвами треків і обкладинками.')}</p>"
+            f"<p>© 2026 Pan Vena<br>{_('Ліцензія: GNU GPL версії 2.')}</p>"
+            f'<p><a href="{HOMEPAGE}">{HOMEPAGE.removeprefix("https://")}</a></p>')
+        box.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        for label in box.findChildren(QLabel):
+            label.setOpenExternalLinks(True)
+        box.exec()
+
+    def restore_layout(self):
+        settings = QSettings(APP, "gui")
+        geometry, state = settings.value("geometry"), settings.value("splitter")
+        if geometry:
+            self.restoreGeometry(geometry)
+        if state:
+            self.split.restoreState(state)
+
+    def save_layout(self):
+        settings = QSettings(APP, "gui")
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("splitter", self.split.saveState())
+
     def open_dir(self, path):
         if path:
             os.makedirs(path, exist_ok=True)
@@ -1119,6 +1606,8 @@ class MainWindow(QMainWindow):
             return
         if self.cur is not None and info.get("DISC_ID") != self.info.get("DISC_ID"):
             self.stop_playback()        # інший диск
+        if info.get("DISC_ID") != self.info.get("DISC_ID"):
+            self.order = []
         self.info = info
         self.titles_stamp = self.titles_mtime()
         self.show_disc()
@@ -1130,6 +1619,7 @@ class MainWindow(QMainWindow):
             b.setEnabled(enabled)
         self.act_album.setEnabled(enabled)
         self.act_mb.setEnabled(enabled)
+        self.act_eject.setEnabled(enabled)
 
     def set_cover(self, path=""):
         pix = QPixmap(path) if path else QPixmap()
@@ -1295,14 +1785,40 @@ class MainWindow(QMainWindow):
             conn.disconnected.connect(conn.deleteLater)
 
     def on_message(self, conn):
+        show = False
         for line in bytes(conn.readAll()).decode(errors="replace").splitlines():
             if line.strip() == "play":
                 self.request_play()
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
+                show = show or not self.play_in_tray()
+            elif line.strip():
+                show = True
+        if show:
+            self.show_window()
 
     def closeEvent(self, event):
+        self.save_layout()
+        # з лотком закриття вікна лише ховає його: програвач грає далі
+        if not self.quitting and self.tray_enabled():
+            event.ignore()
+            self.hide()
+            settings = QSettings(APP, "gui")
+            if settings.value("tray_hint", "false") != "true":
+                settings.setValue("tray_hint", "true")
+                self.tray.showMessage("CD Auto Runner", _("CD Auto Runner працює далі в системному лотку. Щоб вийти, оберіть «Вийти» в меню його значка."),
+                                      QIcon.fromTheme("media-optical-audio"), 6000)
+            return
+        super().closeEvent(event)
+        QApplication.quit()
+
+    def shutdown(self):
+        """Перед виходом з програми (QApplication.aboutToQuit)."""
+        if self.shut_down:
+            return
+        self.shut_down = True
+        if self.isVisible():
+            self.save_layout()
+        if self.tray:
+            self.tray.hide()
         if self.mpv:
             self.mpv.quit()
         self.write_want(None)
@@ -1311,7 +1827,6 @@ class MainWindow(QMainWindow):
             run("stop", timeout=10)
         self.thread.quit()
         self.thread.wait(2000)
-        super().closeEvent(event)
 
 
 def main():
@@ -1347,9 +1862,12 @@ def main():
     server = QLocalServer()
     server.listen(name)
 
+    app.setQuitOnLastWindowClosed(False)   # вікно може ховатися в лоток; виходить closeEvent
     win = MainWindow(play=play)
+    app.aboutToQuit.connect(win.shutdown)
     win.listen(server)
-    win.show()
+    if not (play and win.play_in_tray()):
+        win.show()
     return app.exec()
 
 

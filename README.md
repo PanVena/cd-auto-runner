@@ -12,7 +12,7 @@ Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
 - Rips the disc to your Music folder while it plays (FLAC, Opus, Ogg, MP3 or WAV), with tags and cover art.
 - Gets track titles from MusicBrainz; for discs that aren't there, lets you enter them yourself.
 - Adds actions to Plasma's **Disks & Devices** menu: play, play in another player, rip, enter titles.
-- App window with the disc, its tracks, playback controls and all settings (PySide6; falls back to `kdialog` or the terminal).
+- App window with the disc, its tracks, playback controls and all settings (PySide6; falls back to `kdialog` or the terminal). It hides to the system tray when closed (an inserted disc can also play straight in the tray, without opening the window), the player has shuffle and repeat, and the built-in player shows up in Plasma's Media Player widget and responds to media keys (MPRIS, needs dbus-python).
 - English and Ukrainian interface.
 
 ## Installation
@@ -23,7 +23,7 @@ cd cd-auto-runner
 ./install.sh
 ```
 
-The installer asks for the language and the player, installs `mpv` (the engine of the built-in player), offers to install optional dependencies (`kdialog`, `notify-send`, `cd-paranoia`, `ffmpeg`, PySide6) and starts the service. Everything is installed for the current user; `sudo` is needed only for the dependencies. Run `./install.sh --help` for options.
+The installer asks for the language and the player, installs `mpv` (the engine of the built-in player), offers to install optional dependencies (`kdialog`, `notify-send`, `cd-paranoia`, `ffmpeg`, PySide6, dbus-python) and starts the service. Everything is installed for the current user; `sudo` is needed only for the dependencies. Run `./install.sh --help` for options.
 
 ## Usage
 
