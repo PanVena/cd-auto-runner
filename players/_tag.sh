@@ -75,6 +75,7 @@ mkdir -p "$(dirname "$user")"
 {
   echo "# cd-auto-runner: $CDAR_MB_DISCID ($CDAR_TRACKS)"
   grep -E '^(ALBUM|ALBUM_ARTIST|YEAR|GENRE|[0-9][0-9])=' "$tmp"
+  [[ -z "$CDAR_MBID" ]] || echo "MBID=$CDAR_MBID"     # реліз лишається — і з ним обкладинка
 } > "$user"
 cdar_log "$(_ 'назви збережено: %s' "$user")"
 fi
@@ -107,6 +108,7 @@ if [[ -n "$old_lib" ]]; then
 elif [[ "${CDAR_LIBRARY:-yes}" == yes ]]; then
   mkdir -p "$new_lib" && _cdar_write_marker "$new_lib"
 fi
+_cdar_cover "$new_lib"
 cdar_notify "$CDAR_ALBUM_ARTIST — $CDAR_ALBUM" "$(_ 'Назви збережено.')"
 
 if ((running)); then

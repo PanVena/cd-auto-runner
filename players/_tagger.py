@@ -20,7 +20,7 @@ from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout,
+    QStyledItemDelegate, QTableWidgetItem, QVBoxLayout,
 )
 
 LANG = os.environ.get("CDAR_UI_LANG", "uk")
@@ -112,6 +112,28 @@ class PasteDialog(QDialog):
         return result
 
 
+class CellDelegate(QStyledItemDelegate):
+    """Деякі теми (Kvantum) малюють редактор комірки прозорим, тож під новою назвою видно
+    стару. Кольори такої теми не перебити, тому комірка на час редагування малюється без тексту."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.edited = None
+
+    def createEditor(self, parent, option, index):
+        self.edited = (index.row(), index.column())
+        return super().createEditor(parent, option, index)
+
+    def destroyEditor(self, editor, index):
+        self.edited = None
+        super().destroyEditor(editor, index)
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if (index.row(), index.column()) == self.edited:
+            option.text = ""
+
+
 class Tagger(QDialog):
     def __init__(self, path, title, mb_url):
         super().__init__()
@@ -148,6 +170,7 @@ class Tagger(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setColumnWidth(0, 220)
         self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.table.setItemDelegate(CellDelegate(self.table))
         for n in range(1, count + 1):
             artist, name = tracks.get(n, ("", ""))
             self.table.setItem(n - 1, 0, QTableWidgetItem(artist))

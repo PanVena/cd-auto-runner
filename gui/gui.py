@@ -69,6 +69,8 @@ EN = {
     "Оновити": "Refresh",
     "треків: {n}": "{n} tracks",
     "Назви з MusicBrainz": "Titles from MusicBrainz",
+    "Назви з диска (CD-TEXT)": "Titles from the disc (CD-TEXT)",
+    "MusicBrainz (за назвою)": "MusicBrainz (by name)",
     "З бібліотеки": "From the library",
     "Назви введено вручну": "Titles entered by hand",
     "Кеш KDE": "KDE cache",
@@ -770,13 +772,16 @@ def rounded_pixmap(pix, size, radius=12):
 
 class AlbumTile(QStyledItemDelegate):
     """Плитка альбому: обкладинка, під нею назва й виконавець в один рядок кожен."""
-    COVER = 128
+    COVER = 128         # найменша обкладинка; AlbumGrid збільшує її під ширину панелі
     PAD = 8
     SUBTITLE = Qt.UserRole + 1
 
-    @classmethod
-    def size(cls, metrics):
-        return QSize(cls.COVER + 2 * cls.PAD, cls.COVER + 2 * metrics.height() + 3 * cls.PAD)
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.cover = self.COVER
+
+    def size(self, metrics):
+        return QSize(self.cover + 2 * self.PAD, self.cover + 2 * metrics.height() + 3 * self.PAD)
 
     def sizeHint(self, option, _index):
         return self.size(option.fontMetrics)
@@ -786,12 +791,12 @@ class AlbumTile(QStyledItemDelegate):
         selected = bool(option.state & QStyle.State_Selected)
         p.save()
         rect = option.rect.adjusted(self.PAD, self.PAD, -self.PAD, -self.PAD)
-        index.data(Qt.DecorationRole).paint(p, QRect(rect.topLeft(), QSize(self.COVER, self.COVER)))
+        index.data(Qt.DecorationRole).paint(p, QRect(rect.topLeft(), QSize(self.cover, self.cover)))
         p.setPen(option.palette.color(QPalette.HighlightedText if selected else QPalette.Text))
         font = index.data(Qt.FontRole) or option.font
         p.setFont(font)
         line = option.fontMetrics.height()
-        top = rect.top() + self.COVER + self.PAD // 2
+        top = rect.top() + self.cover + self.PAD // 2
         p.drawText(QRect(rect.left(), top, rect.width(), line), Qt.AlignLeft | Qt.AlignVCenter,
                    p.fontMetrics().elidedText(index.data(Qt.DisplayRole), Qt.ElideRight, rect.width()))
         p.setFont(option.font)
@@ -799,6 +804,34 @@ class AlbumTile(QStyledItemDelegate):
         p.drawText(QRect(rect.left(), top + line, rect.width(), line), Qt.AlignLeft | Qt.AlignVCenter,
                    option.fontMetrics.elidedText(index.data(self.SUBTITLE) or "", Qt.ElideRight, rect.width()))
         p.restore()
+
+
+class AlbumGrid(QListWidget):
+    """Сітка плиток: уся ширина ділиться між колонками, тож збоку не лишається порожнечі."""
+    GAP = 6
+
+    def __init__(self):
+        super().__init__()
+        self.tile = AlbumTile(self)
+        self.setItemDelegate(self.tile)
+        self.fit_tiles()
+
+    def resizeEvent(self, event):
+        self.fit_tiles()
+        super().resizeEvent(event)
+
+    def fit_tiles(self):
+        # Місце під смугу прокрутки відкладаємо завжди: якби воно залежало від її видимості,
+        # більші плитки вмикали б смугу, вона звужувала б плитки — і навпаки, без кінця
+        # (ще 2 px: якщо плитки вміщуються впритул, Qt переносить останню на новий рядок)
+        width = self.width() - self.verticalScrollBar().sizeHint().width() - 2
+        padding = 2 * AlbumTile.PAD + self.GAP
+        cell = width // max(1, width // (AlbumTile.COVER + padding))
+        cover = min(THUMB, max(AlbumTile.COVER, cell - padding))
+        if cover != self.tile.cover or self.gridSize().isEmpty():
+            self.tile.cover = cover
+            self.setGridSize(self.tile.size(self.fontMetrics()) + QSize(self.GAP, self.GAP))
+            self.doItemsLayout()
 
 
 def card():
@@ -1527,19 +1560,16 @@ class MainWindow(QMainWindow):
         box, _form = section(_("Бібліотека"))
         self.lib_empty = QLabel(_("Тут з'являтимуться скопійовані диски."))
         self.lib_empty.setObjectName("muted")
-        self.lib_list = QListWidget()
+        self.lib_list = AlbumGrid()
         self.lib_list.setFrameShape(QFrame.NoFrame)
         self.lib_list.setViewMode(QListView.IconMode)
         self.lib_list.setMovement(QListView.Static)
         self.lib_list.setResizeMode(QListView.Adjust)
         self.lib_list.setUniformItemSizes(True)
-        self.lib_list.setItemDelegate(AlbumTile(self.lib_list))
-        tile = AlbumTile.size(self.lib_list.fontMetrics())
-        self.lib_list.setGridSize(tile + QSize(6, 6))
         self.lib_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.lib_list.setVerticalScrollMode(QListView.ScrollPerPixel)
         self.lib_list.verticalScrollBar().setSingleStep(24)
-        self.lib_list.setMinimumHeight(tile.height() + 12)
+        self.lib_list.setMinimumHeight(self.lib_list.tile.size(self.lib_list.fontMetrics()).height() + 12)
         self.lib_list.itemActivated.connect(self.on_library_item)
         box.layout().addWidget(self.lib_empty)
         box.layout().addWidget(self.lib_list, 1)
@@ -1615,6 +1645,24 @@ class MainWindow(QMainWindow):
         self.pending_play = False
         self.order = []
         self.info = album
+        self.show_disc()
+        self.update_states()
+        self.request_times.emit(folder, [t["path"] for t in album["tracks"]])
+        return True
+
+    def continue_from_library(self):
+        """Диск вийнято, а поточний трек уже є в бібліотеці: файлу диск не потрібен, тож вікно
+        переходить на альбом і відтворення не уривається. False — грати далі нема чого."""
+        if self.album_open():
+            return True
+        folder = self.info.get("LIBRARY_DIR")
+        if self.cur is None or self.want is not None or not folder:
+            return False
+        album = read_album(folder, self.library_root())
+        track = next((t for t in album["tracks"] if t["num"] == self.cur), None) if album else None
+        if track is None:
+            return False
+        self.info, self.cur, self.order = album, track["n"], []
         self.show_disc()
         self.update_states()
         self.request_times.emit(folder, [t["path"] for t in album["tracks"]])
@@ -1875,7 +1923,7 @@ class MainWindow(QMainWindow):
         """Зупиняє копіювання (воно тримає привід) і виймає диск. Решту — вийнятий диск,
         кінець відтворення — зробить poll(), як і тоді, коли диск виймають кнопкою приводу."""
         dev = self.disc.get("DEVICE") or "/dev/sr0"
-        if not self.album_open():       # відкритий альбом грає з бібліотеки, диск йому не потрібен
+        if not self.continue_from_library():
             self.stop_playback()
         self.write_want(None)
         run("stop", timeout=10)
@@ -1942,7 +1990,8 @@ class MainWindow(QMainWindow):
         self.disc = info if inserted and info.get("ok") else {}
         self.titles_stamp = self.titles_mtime()
         # відкритий альбом лишається, поки диск не почнуть відтворювати
-        if self.album_open() and not (self.disc and self.pending_play):
+        if (self.album_open() or not inserted and self.continue_from_library()) \
+                and not (self.disc and self.pending_play):
             self.fill_library()
             return
         if not inserted:
@@ -2009,7 +2058,8 @@ class MainWindow(QMainWindow):
         self.subtitle.setText(sub)
         self.show_meta()
         src = i.get("SOURCE", "none")
-        labels = {"musicbrainz": "Назви з MusicBrainz", "library": "З бібліотеки",
+        labels = {"musicbrainz": "Назви з MusicBrainz", "cdtext": "Назви з диска (CD-TEXT)",
+                  "mbsearch": "MusicBrainz (за назвою)", "library": "З бібліотеки",
                   "user": "Назви введено вручну", "kde": "Кеш KDE", "none": "Диска немає в базах"}
         self.badge.setText(_(labels.get(src, src)))
         self.badge.setObjectName("warn" if src == "none" else "badge")
@@ -2122,7 +2172,7 @@ class MainWindow(QMainWindow):
                 self.reload_info()
             else:
                 self.disc = {}
-                if self.album_open():
+                if self.continue_from_library():
                     self.fill_library()
                 else:
                     self.stop_playback()

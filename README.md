@@ -10,7 +10,7 @@ Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
 - Has its own **built-in player**: it rips the disc first and plays each track from the window as soon as it is ripped.
 - Picks up players installed on your system (including Flatpak and Snap) and preselects your default music player.
 - Rips the disc to your Music folder while it plays (FLAC, Opus, Ogg, MP3 or WAV), with tags and cover art.
-- Gets track titles from MusicBrainz; for discs that aren't there, lets you enter them yourself.
+- Gets track titles from MusicBrainz or from the disc itself (CD-TEXT); if neither has them, lets you enter them yourself. A disc MusicBrainz doesn't know by its ID is looked up by name and track lengths, for the cover and the year.
 - Adds actions to Plasma's **Disks & Devices** menu: play, play in another player, rip, enter titles.
 - App window with the disc, its tracks, playback controls and all settings (PySide6; falls back to `kdialog` or the terminal). It hides to the system tray when closed (an inserted disc can also play straight in the tray, without opening the window), the player has shuffle and repeat, and the built-in player shows up in Plasma's Media Player widget and responds to media keys (MPRIS, needs dbus-python).
 - Works as a regular player too: the **Library** card lists albums you've ripped, and one opens in your chosen player, in place of the inserted disc or with no disc in the drive at all (a custom command can't take files, so with it albums play in the window). Inserting a disc that autoplays takes over from the album.

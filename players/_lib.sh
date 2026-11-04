@@ -239,10 +239,12 @@ cdar_toc_cache() {
 
 _cdar_read_toc() {
   local toc cache audio key sys
+  CDAR_DISC_KEY=""
   cache="$(cdar_toc_cache)"
   audio="$(udevadm info --query=property --name="$CDAR_DEVICE" 2>/dev/null | sed -n 's/^ID_CDROM_MEDIA_TRACK_COUNT_AUDIO=//p')"
   sys="/sys/class/block/$(basename "$(readlink -f "$CDAR_DEVICE")")"
   key="KEY=$(cat "$sys/diskseq" 2>/dev/null):$(cat "$sys/size" 2>/dev/null):$audio"
+  [[ -n "$audio" ]] && CDAR_DISC_KEY="$key"
   if [[ -n "$audio" && -s "$cache" && "$(head -n1 "$cache")" == "$key" ]]; then
     toc="$(tail -n +2 "$cache")"
   else
@@ -349,13 +351,80 @@ _cdar_musicbrainz_url() {
   printf 'https://musicbrainz.org/cdtoc/attach?id=%s&tracks=%s&toc=%s' "$CDAR_MB_DISCID" "$n" "$toc"
 }
 
+# Рядки метаданих із полями через \x1f (MusicBrainz, CD-TEXT) → змінні CDAR_*
+_cdar_read_fields() {
+  local k n v line
+  while IFS=$'\x1f' read -r k n v line; do
+    case "$k" in
+      MBID)   CDAR_MBID="$v" ;;
+      ALBUM)  CDAR_ALBUM="$v" ;;
+      ARTIST) CDAR_ALBUM_ARTIST="$v" ;;
+      YEAR)   CDAR_YEAR="$v" ;;
+      T)      CDAR_TITLES[n-1]="$v"; [[ -n "$line" ]] && CDAR_ARTISTS[n-1]="$line" ;;
+    esac
+  done
+}
+
+# _cdar_disc_cached <назва> <команда…>: вивід команди, збережений до зміни диска (порожній
+# теж). Команда, що завершилась помилкою, не кешується — наступний виклик спробує знову.
+# Копіювання й вікно стартують разом: другий чекає на перший під замком, а не читає
+# диск вдруге, тож обидва бачать той самий результат.
+_cdar_disc_cached() {
+  local cache out
+  cache="$(cdar_toc_cache).$1"; shift
+  mkdir -p "$(dirname "$cache")"
+  {
+    flock -w 120 9
+    if [[ -n "${CDAR_DISC_KEY:-}" && -s "$cache" && "$(head -n1 "$cache")" == "$CDAR_DISC_KEY" ]]; then
+      tail -n +2 "$cache"; return 0
+    fi
+    out="$("$@" 2>/dev/null 9>&-)" || return 1
+    [[ -z "${CDAR_DISC_KEY:-}" ]] || { echo "$CDAR_DISC_KEY"; printf '%s\n' "$out"; } > "$cache"
+    printf '%s\n' "$out"
+  } 9> "$cache.lock"
+}
+
+# CD-TEXT диска у форматі _cdar_read_fields. Кешується: привід щоразу перечитує його
+# з диска, це 15–25 с навіть без копіювання.
+_cdar_cdtext() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  _cdar_disc_cached cdtext timeout -k 5 100 python3 -I "$(dirname "${BASH_SOURCE[0]}")/_cdtext.py" "$CDAR_DEVICE"
+}
+
+# Диск не прив'язаний до MusicBrainz, але назви відомі — шукаємо реліз за назвою й
+# тривалістю треків (це дає обкладинку й рік). Назви з CD-TEXT замінюються назвами
+# з MusicBrainz; відомі звідкись іще (вручну, з бібліотеки) лишаються як є.
+# Кешується: _cdar_metadata викликається на кожне оновлення вікна, а MusicBrainz
+# обмежує частоту запитів.
+_cdar_mb_search() {
+  [[ -z "$CDAR_MBID" && "$CDAR_META_SOURCE" != none && "${CDAR_ONLINE:-yes}" == yes ]] || return 0
+  [[ -n "$CDAR_ALBUM" && -n "$CDAR_ALBUM_ARTIST" && -n "${CDAR_SECTORS[*]:-}" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local out year
+  out="$(_cdar_disc_cached mbsearch timeout -k 5 45 python3 -I "$(dirname "${BASH_SOURCE[0]}")/_mbsearch.py" \
+    "$CDAR_ALBUM_ARTIST" "$CDAR_ALBUM" "${CDAR_SECTORS[@]}")"
+  [[ -n "$out" ]] || return 0
+  if [[ "$CDAR_META_SOURCE" == cdtext ]]; then
+    CDAR_TITLES=(); CDAR_ARTISTS=()
+    _cdar_read_fields <<< "$out"
+    CDAR_META_SOURCE=mbsearch
+    cdar_log "$(_ 'реліз у MusicBrainz знайдено за назвою: %s — %s (%s)' "$CDAR_ALBUM_ARTIST" "$CDAR_ALBUM" "$CDAR_YEAR")"
+  else
+    year="$CDAR_YEAR"
+    _cdar_read_fields < <(grep -E "^(MBID|YEAR)"$'\x1f' <<< "$out")
+    CDAR_YEAR="${year:-$CDAR_YEAR}"
+  fi
+}
+
 # Метадані диска: CDAR_ALBUM, CDAR_ALBUM_ARTIST, CDAR_YEAR, CDAR_GENRE, CDAR_MBID,
-# CDAR_TITLES[], CDAR_ARTISTS[], CDAR_META_SOURCE (user|library|kde|musicbrainz|none). Джерела:
+# CDAR_TITLES[], CDAR_ARTISTS[], CDAR_META_SOURCE (user|library|kde|musicbrainz|cdtext|mbsearch|none). Джерела:
 #   1) назви, введені вручну (cd-auto-runner tag) — мають пріоритет над усім;
 #   1a) мітка .cd-auto-runner у теці альбому в бібліотеці (диск уже копіювали);
 #   2) кеш KDE ~/.cddb/musicbrainz/<discid> (без інтернету);
 #   3) MusicBrainz (якщо CDAR_ONLINE=yes) — також дає id релізу для обкладинки;
-#   4) нічого не знайдено — «Невідомий виконавець / Аудіо-CD», «Трек NN».
+#   4) CD-TEXT на самому диску (без року й обкладинки, тому після баз);
+#   5) нічого не знайдено — «Невідомий виконавець / Аудіо-CD», «Трек NN».
+# Якщо назви є, а релізу немає, _cdar_mb_search шукає його за назвою (джерело mbsearch).
 # Збірка різних виконавців (наприклад, диск із журналу) — виконавець альбому «Various Artists».
 _cdar_metadata() {
   CDAR_ALBUM=""; CDAR_ALBUM_ARTIST=""; CDAR_YEAR=""; CDAR_GENRE=""; CDAR_MBID=""
@@ -392,38 +461,41 @@ _cdar_metadata() {
 
   if [[ "$CDAR_META_SOURCE" != user && "$CDAR_META_SOURCE" != library && "${CDAR_ONLINE:-yes}" == yes && -n "${CDAR_MB_DISCID:-}" ]] \
      && command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-    local json line
+    local json
     json="$(curl -fsS -m 15 -A 'cd-auto-runner/1.0 ( https://github.com/ )' \
       "https://musicbrainz.org/ws/2/discid/$CDAR_MB_DISCID?inc=artist-credits+recordings&fmt=json" 2>/dev/null)"
     if [[ -n "$json" ]]; then
-      while IFS=$'\x1f' read -r k n v line; do
-        case "$k" in
-          MBID)   CDAR_MBID="$v" ;;
-          ALBUM)  CDAR_ALBUM="$v" ;;
-          ARTIST) CDAR_ALBUM_ARTIST="$v" ;;
-          YEAR)   CDAR_YEAR="$v" ;;
-          T)      CDAR_TITLES[n-1]="$v"; [[ -n "$line" ]] && CDAR_ARTISTS[n-1]="$line" ;;
-        esac
-      done < <(python3 -I -c '
+      _cdar_read_fields < <(python3 -I -c '
 import json, sys
 d = json.loads(sys.stdin.read()); want = sys.argv[1]
 def credit(ac): return "".join(a.get("name", "") + a.get("joinphrase", "") for a in ac or [])
-for rel in d.get("releases", []):
-    for m in rel.get("media", []):
-        if any(x.get("id") == want for x in m.get("discs", [])):
-            aa = credit(rel.get("artist-credit"))
-            print("MBID", "", rel["id"], "", sep="\x1f")
-            print("ALBUM", "", rel.get("title", ""), "", sep="\x1f")
-            print("ARTIST", "", aa, "", sep="\x1f")
-            print("YEAR", "", (rel.get("date") or "")[:4], "", sep="\x1f")
-            for t in m.get("tracks", []):
-                ta = credit(t.get("artist-credit"))
-                print("T", t.get("position"), t.get("title", ""), ta if ta != aa else "", sep="\x1f")
-            sys.exit(0)
+# Той самий диск буває в кількох релізах (окремо й у складі набору). Окреме видання
+# точніше: обкладинка саме цього диска. Диск із набору має власну назву (бонусний CD).
+found = [(r, m) for r in d.get("releases", []) for m in r.get("media", [])
+         if any(x.get("id") == want for x in m.get("discs", []))]
+if found:
+    rel, m = min(found, key=lambda f: len(f[0].get("media", [])))
+    aa = credit(rel.get("artist-credit"))
+    print("MBID", "", rel["id"], "", sep="\x1f")
+    print("ALBUM", "", m.get("title") or rel.get("title", ""), "", sep="\x1f")
+    print("ARTIST", "", aa, "", sep="\x1f")
+    print("YEAR", "", min((r["date"][:4] for r, _ in found if r.get("date")), default=""), "", sep="\x1f")
+    for t in m.get("tracks", []):
+        ta = credit(t.get("artist-credit"))
+        print("T", t.get("position"), t.get("title", ""), ta if ta != aa else "", sep="\x1f")
 ' "$CDAR_MB_DISCID" <<< "$json" 2>/dev/null)
       [[ -n "$CDAR_MBID" ]] && CDAR_META_SOURCE=musicbrainz && cdar_log "$(_ 'метадані з MusicBrainz: %s — %s (%s)' "$CDAR_ALBUM_ARTIST" "$CDAR_ALBUM" "$CDAR_YEAR")"
     fi
   fi
+
+  if [[ "$CDAR_META_SOURCE" == none ]]; then
+    _cdar_read_fields < <(_cdar_cdtext)
+    if [[ -n "$CDAR_ALBUM$CDAR_ALBUM_ARTIST${CDAR_TITLES[*]:-}" ]]; then
+      CDAR_META_SOURCE=cdtext
+      cdar_log "$(_ 'метадані з CD-TEXT: %s — %s' "$CDAR_ALBUM_ARTIST" "$CDAR_ALBUM")"
+    fi
+  fi
+  _cdar_mb_search
 
   # Виконавець альбому не вказаний, а виконавці треків різні — це збірка
   if [[ -z "$CDAR_ALBUM_ARTIST" ]]; then
@@ -528,6 +600,7 @@ _cdar_retag_library() {
       )
       [[ -n "$CDAR_YEAR" ]] && meta+=(-metadata "date=$CDAR_YEAR")
       [[ "$CDAR_ALBUM_ARTIST" == "Various Artists" ]] && meta+=(-metadata "compilation=1")
+      [[ -n "$CDAR_MBID" ]] && meta+=(-metadata "MUSICBRAINZ_ALBUMID=$CDAR_MBID")
       [[ -n "${CDAR_MB_DISCID:-}" ]] && meta+=(-metadata "MUSICBRAINZ_DISCID=$CDAR_MB_DISCID")
       if ffmpeg -nostdin -hide_banner -loglevel error -y -i "$f" -map 0 -c copy "${meta[@]}" \
            -f "$(case "$ext" in opus|ogg) echo ogg ;; *) echo "$ext" ;; esac)" "$out.part" \
