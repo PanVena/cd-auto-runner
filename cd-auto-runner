@@ -6,7 +6,7 @@
 # Copyright (C) 2026 Pan Vena
 set -uo pipefail
 
-VERSION="1.3.1"
+VERSION="1.4.0"
 APP="cd-auto-runner"
 APP_TITLE="CD Auto Runner"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
@@ -60,6 +60,7 @@ LIBRARY="yes"     # зберігати скопійовані альбоми в 
 LIBRARY_DIR=""    # порожньо — XDG MUSIC (напр. ~/Музика)
 ONLINE="yes"      # назви, рік і обкладинка з MusicBrainz
 UI_LANG=""        # мова інтерфейсу: uk | en (порожньо — мова системи)
+GUI="qt"          # вікно програми: qt (PySide6) | gtk (GTK 4, libadwaita) | none (лише служба)
 
 # ---------------------------------------------------------------------------
 # Допоміжні функції
@@ -199,6 +200,7 @@ load_config() {
       LIBRARY_DIR) LIBRARY_DIR="$value" ;;
       ONLINE)      ONLINE="$value" ;;
       UI_LANG)     UI_LANG="$value" ;;
+      GUI)         GUI="$value" ;;
     esac
   done < "$CONFIG_FILE"
   return 0
@@ -226,6 +228,8 @@ save_config() {
     echo "ONLINE=$ONLINE"
     echo "# $(_ 'Мова інтерфейсу: uk | en')"
     echo "UI_LANG=$UI_LANG"
+    echo "# $(_ 'Вікно програми: qt (PySide6) | gtk (GTK 4, libadwaita) | none (без вікна)')"
+    echo "GUI=$GUI"
   } > "$tmp"
   mv -f "$tmp" "$CONFIG_FILE"
 }
@@ -429,28 +433,49 @@ list_drives() {
 
 valid_device() { [[ "$1" =~ ^/dev/[A-Za-z0-9_/.-]+$ ]]; }
 
-# Вбудований програвач: вікно програми (gui.py, PySide6) відтворює треки через mpv
-gui_path() {
+# Вбудований програвач: вікно програми відтворює треки через mpv. Вікон два, рівнозначних:
+# gui.py (PySide6) і gui_gtk.py (GTK 4, libadwaita); яке — обирається під час інсталяції (GUI).
+# GUI=none — вікна немає зовсім: служба лише запускає обраний програвач.
+gui_path() {  # gui_path <файл>
   local g
-  for g in "$(dirname "$SELF")/gui/gui.py" "$DATA_DIR/$APP/gui.py"; do
+  for g in "$(dirname "$SELF")/gui/$1" "$DATA_DIR/$APP/$1"; do
     [[ -f "$g" ]] && { printf '%s' "$g"; return 0; }
   done
   return 1
 }
 # Прапорець Python для вікна. -I не бачить site-packages користувача, а саме туди
 # PySide6 ставить pip; тоді -P (Python 3.11+): так само без поточної теки в sys.path.
-PYSIDE_FLAG=unknown
-has_pyside() {
-  if [[ "$PYSIDE_FLAG" == unknown ]]; then
-    PYSIDE_FLAG=none
-    local f
-    for f in -I -P ""; do
-      python3 $f -c 'import PySide6.QtWidgets' 2>/dev/null && { PYSIDE_FLAG="$f"; break; }
+python_flag() {  # python_flag <код перевірки> → прапорець; код виходу — чи пройшла перевірка
+  local f
+  for f in -I -P ""; do
+    python3 $f -c "$1" 2>/dev/null && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+# Обране вікно; якщо для нього бракує бібліотек — друге: програма важливіша за вигляд.
+# Результат запам'ятовується: перевірка імпорту забирає помітний час.
+GUI_FILE=""; GUI_FLAG=""; GUI_DONE=0
+find_gui() {
+  if ((!GUI_DONE)); then
+    GUI_DONE=1
+    local kind chosen
+    local -a order=(qt gtk)
+    chosen="$(sed -n 's/^GUI=//p' "$CONFIG_FILE" 2>/dev/null | tail -n1)"
+    [[ "$chosen" == gtk ]] && order=(gtk qt)
+    [[ "$chosen" == none ]] && order=()
+    for kind in "${order[@]}"; do
+      if [[ "$kind" == gtk ]]; then
+        gui_path gui_gtk.py >/dev/null && GUI_FLAG="$(python_flag "$GTK_CHECK")" && { GUI_FILE="$(gui_path gui_gtk.py)"; break; }
+      else
+        gui_path gui.py >/dev/null && GUI_FLAG="$(python_flag 'import PySide6.QtWidgets')" && { GUI_FILE="$(gui_path gui.py)"; break; }
+      fi
     done
   fi
-  [[ "$PYSIDE_FLAG" != none ]]
+  [[ -n "$GUI_FILE" ]]
 }
-builtin_available() { have mpv && gui_path >/dev/null && has_pyside; }
+# Те саме перевіряє install.sh: libadwaita 1.5 — це Adw.Dialog, Adw.AlertDialog та інші
+GTK_CHECK='import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Adw, Gtk; assert (Adw.MAJOR_VERSION, Adw.MINOR_VERSION) >= (1, 5)'
+builtin_available() { have mpv && find_gui; }
 builtin_name() { _ 'CD Auto Runner (вбудований програвач)'; }
 
 # ---------------------------------------------------------------------------
@@ -680,8 +705,8 @@ cmd_play() {
   elif [[ "$want" == builtin ]]; then
     [[ -n "$BUILTIN_ADAPTER" && -n "$CDAR_LIB" ]] || die "$(_ 'не знайдено players/_builtin.sh. Перевстановіть %s.' "$APP")"
     have mpv || die "$(_ 'для вбудованого програвача потрібен mpv. Встановіть його (пакет mpv) або перевстановіть %s.' "$APP")"
-    if ((window)) && ! { gui_path >/dev/null && has_pyside; }; then
-      die "$(_ 'для вбудованого програвача потрібен PySide6 (пакет python3-pyside6).')"
+    if ((window)) && ! find_gui; then
+      die "$(_ 'для вбудованого програвача потрібне вікно програми: PySide6 або GTK 4 з libadwaita. Перевстановіть %s.' "$APP")"
     fi
     adapter="$BUILTIN_ADAPTER"; name="$(builtin_name)"; exec="true"; fp=""; id="builtin"
   else
@@ -826,6 +851,15 @@ cmd_set() {
     RIP_FORMAT) [[ "$v" =~ ^(flac|opus|ogg|mp3|wav)$ ]] || die "$(_ 'невідомий формат: %s' "$v")"; RIP_FORMAT="$v" ;;
     LIBRARY|ONLINE|NOTIFY) [[ "$v" == yes || "$v" == no ]] || die "yes | no"; printf -v "$k" '%s' "$v" ;;
     LIBRARY_DIR) LIBRARY_DIR="$v" ;;
+    GUI)
+      [[ "$v" == qt || "$v" == gtk || "$v" == none ]] || die "qt | gtk | none"
+      GUI="$v"
+      # вбудований програвач живе у вікні: без нього діло залишається за обраним програвачем
+      if [[ "$v" == none && "$PLAYER_ID" == builtin ]]; then
+        PLAYER_ID=""; PLAYER_NAME=""
+        log "$(_ 'Вбудований програвач працює лише у вікні. Оберіть інший: %s choose' "$APP")"
+      fi
+      ;;
     *) die "$(_ 'невідомий параметр: %s' "$k")" ;;
   esac
   save_config
@@ -941,12 +975,14 @@ cmd_tag() {
       "CDAR_EXEC=true" "CDAR_NAME=$APP_TITLE" "CDAR_NOTIFY=$NOTIFY" "CDAR_DRY_RUN=0" \
       "CDAR_RIP_FORMAT=$RIP_FORMAT" "CDAR_LIBRARY=$LIBRARY" "CDAR_LIBRARY_DIR=$LIBRARY_DIR" \
       "CDAR_ONLINE=$ONLINE" "CDAR_UI_LANG=$CDAR_UI_LANG" "CDAR_I18N=$CDAR_I18N" "CDAR_SELF=$SELF" \
-      "CDAR_TTY=${CDAR_TTY:-0}" bash "$TAG_ADAPTER"
+      "CDAR_GUI=$GUI" "CDAR_TTY=${CDAR_TTY:-0}" bash "$TAG_ADAPTER"
 }
 
 # Сповіщення «назви невідомі» з кнопкою «Ввести назви…» (запускає адаптер копіювання)
 cmd_ask_tag() {
   local dev="${1:-}" act
+  load_config || true
+  [[ "$GUI" == none ]] && return 0      # без вікна нічого не питаємо: назви можна ввести командою tag
   have notify-send && has_display || return 0
   act="$(notify-send -a "$APP_TITLE" -i "$ICON" -h "string:desktop-entry:$APP" -A "tag=$(_ 'Ввести назви…')" \
     "$(_ 'Назви треків невідомі')" \
@@ -1118,6 +1154,7 @@ cmd_status() {
     row "$(_ 'Програвач')" "$(_ 'не обрано (%s choose)' "$APP")"
   fi
   row "$(_ 'Мова')" "$CDAR_UI_LANG"
+  row "$(_ 'Вікно програми')" "$GUI"
   if systemctl --user cat "$SERVICE" >/dev/null 2>&1; then
     row "$(_ 'Служба')" "$(_ '%s, автозапуск: %s' "$(systemctl --user is-active "$SERVICE" 2>/dev/null)" "$(systemctl --user is-enabled "$SERVICE" 2>/dev/null)")"
   elif [[ -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/$APP.desktop" ]]; then
@@ -1184,9 +1221,8 @@ run_action() {
 }
 
 cmd_settings() {
-  # Повноцінне вікно (PySide6), якщо можна; інакше — меню в діалогах або в терміналі.
+  # Повноцінне вікно, якщо можна; інакше — меню в діалогах або в терміналі.
   # --play [ПРИСТРІЙ] — одразу відтворювати диск у вбудованому програвачі
-  local gui
   local -a gargs=()
   while (($#)); do
     case "$1" in
@@ -1195,9 +1231,9 @@ cmd_settings() {
     esac
     shift
   done
-  if [[ "${CDAR_TTY:-0}" != 1 ]] && has_display && gui="$(gui_path)" && has_pyside; then
+  if [[ "${CDAR_TTY:-0}" != 1 ]] && has_display && find_gui; then
     # shellcheck disable=SC2086  # порожній прапорець не має ставати окремим аргументом
-    CDAR_UI_LANG="$CDAR_UI_LANG" CDAR_SELF="$SELF" exec python3 $PYSIDE_FLAG "$gui" "${gargs[@]}"
+    CDAR_UI_LANG="$CDAR_UI_LANG" CDAR_SELF="$SELF" exec python3 $GUI_FLAG "$GUI_FILE" "${gargs[@]}"
   fi
   need_interactive "$(_ 'немає ні діалогів (kdialog, zenity), ні терміналу')" settings --tty
   local pick svc d

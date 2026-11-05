@@ -42,10 +42,14 @@ MODE="auto"       # auto | systemd | autostart
 UNINSTALL=0
 PURGE=0
 LANG_ARG=""
+GUI_ARG=""        # qt | gtk | none
 
 # shellcheck source=i18n.sh
 source "$SRC/i18n.sh"
 CDAR_UI_LANG="$(sed -n 's/^UI_LANG=//p' "$CFG" 2>/dev/null | tail -n1 || true)"
+# до того, як вибір мови запише налаштування: їх наявність відрізняє оновлення від першого встановлення
+GUI_CUR="$(sed -n 's/^GUI=//p' "$CFG" 2>/dev/null | tail -n1 || true)"
+[[ -z "$GUI_CUR" && -f "$CFG" ]] && GUI_CUR=qt
 [[ "$CDAR_UI_LANG" == en || "$CDAR_UI_LANG" == uk ]] || CDAR_UI_LANG="$(cdar_detect_lang)"
 
 # --------------------------------------------------------------------------
@@ -76,6 +80,7 @@ usage() {
 
   -y, --yes          відповідати «так» на всі запитання
       --lang uk|en   мова інтерфейсу (інакше — запитати)
+      --gui qt|gtk|none  вікно програми: Qt (PySide6), GTK 4 для GNOME або без вікна (інакше — запитати)
       --no-deps      не пропонувати встановити залежності
       --choose       завжди запитати, який програвач використовувати
       --no-choose    не запитувати програвач (залишити поточний)
@@ -92,6 +97,8 @@ while (($#)); do
     -y|--yes) ASSUME_YES=1 ;;
     --lang) LANG_ARG="${2:-}"; shift ;;
     --lang=*) LANG_ARG="${1#*=}" ;;
+    --gui) GUI_ARG="${2:-}"; shift ;;
+    --gui=*) GUI_ARG="${1#*=}" ;;
     --no-deps) SKIP_DEPS=1 ;;
     --choose) CHOOSE=yes ;;
     --no-choose) CHOOSE=no ;;
@@ -112,7 +119,7 @@ if ((UNINSTALL)); then
   exec bash "$SRC/uninstall.sh" "${args[@]}"
 fi
 
-for f in "$APP" i18n.sh gui/gui.py systemd/$APP.service desktop/$APP.desktop desktop/$APP.svg players/_lib.sh players/_generic.sh; do
+for f in "$APP" i18n.sh gui/gui.py gui/gui_gtk.py gui/cdar_core.py systemd/$APP.service desktop/$APP.desktop desktop/$APP.svg players/_lib.sh players/_generic.sh; do
   [[ -f "$SRC/$f" ]] || fail "$(_ 'не знайдено файл %s — запускайте install.sh з теки проєкту.' "$SRC/$f")"
 done
 
@@ -131,6 +138,31 @@ fi
 export CDAR_UI_LANG
 CDAR_UI_LANG="$CDAR_UI_LANG" bash "$SRC/$APP" lang "$CDAR_UI_LANG" >/dev/null
 ok "$(_ 'Мова інтерфейсу: %s' "$([[ $CDAR_UI_LANG == en ]] && echo English || echo Українська)")"
+
+# Вікно програми: у GNOME типово GTK, деінде Qt. При оновленні лишається те, що обрано раніше;
+# без параметра GUI у налаштуваннях це встановлення Qt-версії.
+if [[ -n "$GUI_ARG" ]]; then
+  [[ "$GUI_ARG" == qt || "$GUI_ARG" == gtk || "$GUI_ARG" == none ]] || fail "$(_ 'невідоме вікно: %s (qt | gtk | none)' "$GUI_ARG")"
+  GUI="$GUI_ARG"
+else
+  if [[ "$GUI_CUR" == qt || "$GUI_CUR" == gtk || "$GUI_CUR" == none ]]; then GUI="$GUI_CUR"
+  elif desktop_is GNOME; then GUI=gtk
+  else GUI=qt
+  fi
+  if ((!ASSUME_YES)) && [[ -t 0 ]]; then
+    case "$GUI" in gtk) gui_default=GTK ;; qt) gui_default=Qt ;; *) gui_default="$(_ 'без вікна')" ;; esac
+    printf '\n%s==>%s %s%s%s\n' "$c_ok" "$c_0" "$c_b" "$(_ 'Вікно програми')" "$c_0"
+    echo "  1) $(_ 'Qt (PySide6): для KDE Plasma, зі значком у системному лотку')$([[ $GUI == qt ]] && echo '  *')"
+    echo "  2) $(_ 'GTK 4 (libadwaita): для GNOME, рідний вигляд, без лотка')$([[ $GUI == gtk ]] && echo '  *')"
+    echo "  3) $(_ 'Без вікна: лише служба, що запускає обраний програвач')$([[ $GUI == none ]] && echo '  *')"
+    read -rp "  [1-3, Enter — $gui_default]: " n || n=""
+    case "$n" in 1) GUI=qt ;; 2) GUI=gtk ;; 3) GUI=none ;; esac
+  fi
+fi
+case "$GUI" in gtk) gui_label='GTK 4' ;; qt) gui_label=Qt ;; *) gui_label="$(_ 'без вікна')" ;; esac
+ok "$(_ 'Вікно програми: %s' "$gui_label")"
+# одразу: від вікна залежить, чи є вбудований програвач, а отже, й перевірка програвачів нижче
+bash "$SRC/$APP" set GUI "$GUI" | sed 's/^/  /'
 
 # --------------------------------------------------------------------------
 step "$(_ 'Перевірка системи')"
@@ -162,11 +194,12 @@ if [[ -n "$drives" ]]; then
 fi
 
 # --------------------------------------------------------------------------
-pkg_install() {  # pkg_install <пакет-dnf> <пакет-apt> <пакет-pacman> <пакет-zypper>
-  if have dnf; then sudo dnf install -y "$1"
-  elif have apt-get; then sudo apt-get install -y "$2"
-  elif have pacman; then sudo pacman -S --needed --noconfirm "$3"
-  elif have zypper; then sudo zypper --non-interactive install "$4"
+pkg_install() {  # pkg_install <пакети-dnf> <пакети-apt> <пакети-pacman> <пакети-zypper> (кілька — через кому)
+  # shellcheck disable=SC2086  # кома стає пробілом навмисно
+  if have dnf; then sudo dnf install -y ${1//,/ }
+  elif have apt-get; then sudo apt-get install -y ${2//,/ }
+  elif have pacman; then sudo pacman -S --needed --noconfirm ${3//,/ }
+  elif have zypper; then sudo zypper --non-interactive install ${4//,/ }
   else return 1
   fi
 }
@@ -180,7 +213,8 @@ ok "$(_ 'systemctl, flock: є')"
 
 # mpv — рушій вбудованого програвача: ставимо без запитання (окремий процес, не
 # входить до складу програми; пакет і його оновлення дає дистрибутив)
-if have mpv; then ok "$(_ 'mpv: є')"
+if [[ "$GUI" == none ]]; then :      # вбудованого програвача без вікна немає
+elif have mpv; then ok "$(_ 'mpv: є')"
 elif ((SKIP_DEPS)); then warn "$(_ 'mpv не встановлено (--no-deps) — вбудований програвач буде недоступний.')"
 else
   warn "$(_ 'mpv не встановлено — він потрібен для вбудованого програвача. Встановлюю (потрібен sudo)…')"
@@ -197,6 +231,7 @@ declare -A OPT_DESC=(
   [cd-paranoia]="$(_ 'копіювання треків для Elisa, QMPlay2, Audacious і бібліотеки музики')"
   [ffmpeg]="$(_ 'кодування треків у FLAC/Opus/MP3 для бібліотеки музики')"
   [pyside6]="$(_ 'вікно програми, вбудований програвач і форма для введення назв треків')"
+  [gtk4]="$(_ 'вікно програми, вбудований програвач і форма для введення назв треків')"
   [dbus-python]="$(_ 'вбудований програвач у системних елементах керування музикою і на мультимедійних клавішах (MPRIS)')"
 )
 declare -A OPT_PKG=(  # dnf apt pacman zypper
@@ -206,18 +241,25 @@ declare -A OPT_PKG=(  # dnf apt pacman zypper
   [cd-paranoia]="libcdio-paranoia cdparanoia cdparanoia cdparanoia"
   [ffmpeg]="ffmpeg-free ffmpeg ffmpeg ffmpeg"
   [pyside6]="python3-pyside6 python3-pyside6.qtwidgets pyside6 python3-pyside6"
+  [gtk4]="python3-gobject,gtk4,libadwaita python3-gi,gir1.2-gtk-4.0,gir1.2-adw-1 python-gobject,gtk4,libadwaita python3-gobject-Gdk,typelib-1_0-Gtk-4_0,typelib-1_0-Adw-1"
   [dbus-python]="python3-dbus python3-dbus python-dbus python3-dbus-python"
 )
 has_tool() {
   case "$1" in
     cd-paranoia) have cd-paranoia || have cdparanoia ;;
     pyside6) python3 -c 'import PySide6.QtWidgets' 2>/dev/null ;;
+    gtk4) python3 -c "$GTK_CHECK" 2>/dev/null ;;
     dbus-python) python3 -c 'import dbus.mainloop.glib' 2>/dev/null ;;
     *) have "$1" ;;
   esac
 }
+# те саме перевіряє cd-auto-runner: libadwaita 1.5 — це Adw.Dialog, Adw.AlertDialog та інші
+GTK_CHECK='import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Adw, Gtk; assert (Adw.MAJOR_VERSION, Adw.MINOR_VERSION) >= (1, 5)'
 if desktop_is KDE; then dialog_tool=kdialog; else dialog_tool=zenity; fi
-for tool in "$dialog_tool" notify-send cd-paranoia ffmpeg pyside6 dbus-python; do
+gui_lib=pyside6; [[ "$GUI" == gtk ]] && gui_lib=gtk4
+tools=("$dialog_tool" notify-send cd-paranoia ffmpeg "$gui_lib" dbus-python)
+[[ "$GUI" == none ]] && tools=(notify-send cd-paranoia ffmpeg)   # програвачам, що отримують скопійовані треки
+for tool in "${tools[@]}"; do
   if has_tool "$tool"; then ok "$(_ '%s: є' "$tool")"; continue; fi
   warn "$(_ '%s не встановлено — %s' "$tool" "${OPT_DESC[$tool]}")"
   ((SKIP_DEPS)) && continue
@@ -235,7 +277,7 @@ tray_available() {
   gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
     --method org.freedesktop.DBus.NameHasOwner org.kde.StatusNotifierWatcher 2>/dev/null | grep -q true
 }
-if desktop_is GNOME && have gdbus && ! tray_available; then
+if [[ "$GUI" == qt ]] && desktop_is GNOME && have gdbus && ! tray_available; then
   warn "$(_ 'у GNOME немає системного лотка без розширення AppIndicator (значок програми, згортання в лоток).')"
   if ((!SKIP_DEPS)) && ask "$(_ 'Встановити розширення AppIndicator (потрібен sudo)?')" n; then
     if pkg_install gnome-shell-extension-appindicator gnome-shell-extension-appindicator \
@@ -280,7 +322,11 @@ pkill -u "$USER" -f "$APP watch" 2>/dev/null || true
 
 install -Dm755 "$SRC/$APP" "$BIN";                          ok "$BIN"
 install -Dm644 "$SRC/i18n.sh" "$DATA_DIR/$APP/i18n.sh";     ok "$DATA_DIR/$APP/i18n.sh"
-install -Dm755 "$SRC/gui/gui.py" "$DATA_DIR/$APP/gui.py";   ok "$DATA_DIR/$APP/gui.py"
+for f in gui.py gui_gtk.py cdar_core.py; do
+  if [[ "$GUI" == none ]]; then rm -f "$DATA_DIR/$APP/$f"; continue; fi
+  install -Dm755 "$SRC/gui/$f" "$DATA_DIR/$APP/$f";         ok "$DATA_DIR/$APP/$f"
+done
+[[ "$GUI" == none ]] && rm -rf "$DATA_DIR/$APP/__pycache__"
 install -Dm755 "$SRC/uninstall.sh" "$DATA_DIR/$APP/uninstall.sh"   # без клонування іншої копії немає
 PLAYERS_DIR="$DATA_DIR/$APP/players"
 rm -rf "$PLAYERS_DIR"; mkdir -p "$PLAYERS_DIR"
@@ -289,8 +335,17 @@ for f in "$SRC"/players/*.sh "$SRC"/players/*.py; do [[ "$(basename "$f")" == _l
 ok "$(_ '%s (адаптерів програвачів: %s)' "$PLAYERS_DIR" "$(ls "$SRC"/players/[!_]*.sh | wc -l)")"
 mkdir -p "$APPS_DIR"
 subst "$SRC/desktop/$APP.desktop" "$APPS_DIR/$APP.desktop"; ok "$(_ '%s (меню програм)' "$APPS_DIR/$APP.desktop")"
+# Значок у доку: GTK-вікно звітує про ідентифікатор програми, а не про ім'я .desktop-файлу
+if [[ "$GUI" == gtk ]]; then
+  sed -i "s|^StartupWMClass=.*|StartupWMClass=$(sed -n 's/^APP_ID = "\([^"]*\)".*/\1/p' "$SRC/gui/gui_gtk.py")|" "$APPS_DIR/$APP.desktop"
+fi
+# Без вікна відкривати нічого: запис лишається для системи (обробник аудіо-CD), але не в меню
+[[ "$GUI" == none ]] && sed -i '/^Type=Application/a NoDisplay=true' "$APPS_DIR/$APP.desktop"
 ICON_DIR="$DATA_DIR/icons/hicolor"
 install -Dm644 "$SRC/desktop/$APP.svg" "$ICON_DIR/scalable/apps/$APP.svg"; ok "$ICON_DIR/scalable/apps/$APP.svg"
+for f in heart heart-filled; do     # у темі Adwaita сердець немає
+  install -Dm644 "$SRC/desktop/$APP-$f-symbolic.svg" "$ICON_DIR/symbolic/apps/$APP-$f-symbolic.svg"
+done
 touch "$ICON_DIR"   # нова дата теки: кеш значків застарів
 
 case ":$PATH:" in
@@ -309,7 +364,11 @@ if [[ "$CHOOSE" == auto ]]; then
   fi
 fi
 if [[ "$CHOOSE" == yes ]]; then
-  if [[ -t 0 ]] || have kdialog || have zenity; then
+  if [[ "$GUI" == none ]]; then    # жодних діалогів: лише термінал
+    if [[ -t 0 ]]; then "$BIN" choose --tty || warn "$(_ 'програвач не обрано — зробіть це пізніше: %s choose' "$APP")"
+    else warn "$(_ 'немає терміналу: буде запускатися типовий програвач системи. Обрати: %s choose' "$APP")"
+    fi
+  elif [[ -t 0 ]] || have kdialog || have zenity; then
     "$BIN" choose || warn "$(_ 'програвач не обрано — зробіть це пізніше: %s choose' "$APP")"
   else
     warn "$(_ 'немає ні терміналу, ні діалогів (kdialog, zenity) — оберіть програвач пізніше: %s choose' "$APP")"
@@ -383,6 +442,8 @@ have update-desktop-database && update-desktop-database "$APPS_DIR" >/dev/null 2
 step "$(_ 'Готово!')"
 "$BIN" status | sed 's/^/  /'
 echo
+# пункта в меню програм без вікна немає
+if [[ "$GUI" == none ]]; then hint() { sed '0,/choose/s/ *(.*$//'; }; else hint() { cat; }; fi
 _ '  Вставте аудіо-CD — обраний програвач запуститься автоматично.
 
   Змінити програвач:   %s choose   (або «CD Auto Runner» у меню програм)
@@ -392,4 +453,4 @@ _ '  Вставте аудіо-CD — обраний програвач запу
   Стан:                %s status
   Журнал:              journalctl --user -u %s -f
   Видалити:            %s
-' "$APP" "$APP" "$APP" "$APP" "$APP" "$APP" "$APP" "$DATA_DIR/$APP/uninstall.sh"
+' "$APP" "$APP" "$APP" "$APP" "$APP" "$APP" "$APP" "$DATA_DIR/$APP/uninstall.sh" | hint

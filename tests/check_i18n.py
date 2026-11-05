@@ -35,19 +35,29 @@ def translations():
     return dict(zip(out[0::2], out[1::2]))
 
 
-PY_FILES = [os.path.join(ROOT, "gui", "gui.py"), os.path.join(ROOT, "players", "_tagger.py")]
+# У файлах із власним словником EN він у самому файлі; вікна беруть його зі спільного cdar_core.py
+SHARED_EN = os.path.join(ROOT, "gui", "cdar_core.py")
+TAGGER_EN = os.path.join(ROOT, "players", "_tagger_common.py")
+PY_FILES = [SHARED_EN, os.path.join(ROOT, "gui", "gui.py"), os.path.join(ROOT, "gui", "gui_gtk.py"),
+            TAGGER_EN, os.path.join(ROOT, "players", "_tagger.py"), os.path.join(ROOT, "players", "_tagger_gtk.py")]
 PY_CALL = re.compile(r"""\b_\(\s*((?:"(?:[^"\\]|\\.)*"\s*)+)""")
 
 
 def check_python():
-    """У gui.py і _tagger.py — власний словник EN: кожен _("…") має бути в ньому."""
+    """Кожен _("…") має бути в словнику EN: власному або спільному."""
     import ast
+
+    def dictionary(tree):
+        return next((ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                     and any(getattr(t, "id", "") == "EN" for t in n.targets)), {})
+    def shared(path):
+        with open(path, encoding="utf-8") as f:
+            return dictionary(ast.parse(f.read()))
     errors = []
     for path in PY_FILES:
         src = open(path, encoding="utf-8").read()
         tree = ast.parse(src)
-        en = next((ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
-                   and any(getattr(t, "id", "") == "EN" for t in n.targets)), {})
+        en = shared(TAGGER_EN if "tagger" in os.path.basename(path) else SHARED_EN)
         used = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_" and node.args \

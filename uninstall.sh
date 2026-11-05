@@ -50,6 +50,8 @@ for f in \
   "$DATA_DIR/solid/actions/$APP.desktop" \
   "$DATA_DIR/applications/$APP.desktop" \
   "$DATA_DIR/icons/hicolor/scalable/apps/$APP.svg" \
+  "$DATA_DIR/icons/hicolor/symbolic/apps/$APP-heart-symbolic.svg" \
+  "$DATA_DIR/icons/hicolor/symbolic/apps/$APP-heart-filled-symbolic.svg" \
   "$CONF_DIR/autostart/$APP.desktop"; do
   [[ -e "$f" ]] && rm -f "$f" && { _ '  видалено %s' "$f"; echo; }
 done

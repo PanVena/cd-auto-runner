@@ -51,12 +51,20 @@ trap 'rm -f -- "$tmp"' EXIT
 # --- редагування ------------------------------------------------------------
 title="$(_ 'Назви треків (на диску: %s)' "$CDAR_TRACKS")"
 gui=0; [[ "${CDAR_TTY:-0}" != 1 && -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && gui=1
-tagger="$(dirname "$CDAR_LIB")/_tagger.py"
-# -I не бачить PySide6, встановлений через pip у теку користувача; тоді -P (див. has_pyside)
-pyflag=none
-if ((gui)) && [[ -f "$tagger" ]]; then
-  for f in -I -P ""; do
-    python3 $f -c 'import PySide6.QtWidgets' 2>/dev/null && { pyflag="$f"; break; }
+# Форма того самого вигляду, що й вікно програми; бракує бібліотек — друга форма
+gtk_check='import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Adw, Gtk; assert (Adw.MAJOR_VERSION, Adw.MINOR_VERSION) >= (1, 5)'
+forms=(_tagger.py _tagger_gtk.py)
+[[ "${CDAR_GUI:-qt}" == gtk ]] && forms=(_tagger_gtk.py _tagger.py)
+[[ "${CDAR_GUI:-qt}" == none ]] && forms=()     # далі — zenity, kdialog або редактор у терміналі
+# -I не бачить PySide6, встановлений через pip у теку користувача; тоді -P (див. python_flag)
+pyflag=none; tagger=""
+if ((gui)); then
+  for form in "${forms[@]}"; do
+    [[ -f "$(dirname "$CDAR_LIB")/$form" ]] || continue
+    check='import PySide6.QtWidgets'; [[ "$form" == _tagger_gtk.py ]] && check="$gtk_check"
+    for f in -I -P ""; do
+      python3 $f -c "$check" 2>/dev/null && { pyflag="$f"; tagger="$(dirname "$CDAR_LIB")/$form"; break 2; }
+    done
   done
 fi
 # У KDE простий редактор — kdialog, деінде спершу zenity
@@ -65,7 +73,7 @@ dialogs="zenity kdialog"
 dialog=""
 for d in $dialogs; do command -v "$d" >/dev/null 2>&1 && { dialog="$d"; break; }; done
 if [[ "$pyflag" != none ]]; then
-  # Форма з полями й таблицею треків (PySide6)
+  # Форма з полями й таблицею треків
   # shellcheck disable=SC2086  # порожній прапорець не має ставати окремим аргументом
   python3 $pyflag "$tagger" "$tmp" "$title" "$(_cdar_musicbrainz_url)" || { cdar_log "$(_ 'Скасовано.')"; exit 0; }
 elif ((gui)) && [[ "$dialog" == zenity ]]; then

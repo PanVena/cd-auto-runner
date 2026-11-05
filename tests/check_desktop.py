@@ -202,6 +202,83 @@ sys.exit(1 if missing else 0)
     assert p.returncode == 0, f"значки Adwaita: {p.stdout}{p.stderr}"
 
 
+def check_gui_choice(root):
+    """Вікно за параметром GUI; бракує бібліотек обраного — запускається друге."""
+    def launched(name, gui, qt=0, gtk=0):
+        sb = Sandbox(root, name, "GNOME")
+        stub(sb.stubs, "python3", f'''case "$*" in *PySide6.QtWidgets*) exit {qt} ;; *'"Adw"'*) exit {gtk} ;; esac''')
+        cfg = os.path.join(sb.home, ".config", "cd-auto-runner")
+        os.makedirs(cfg)
+        with open(os.path.join(cfg, "config"), "w") as f:
+            f.write(f"PLAYER_ID=off\n{gui}")
+        sb.run("settings")
+        return [c for c in sb.calls() if c.endswith(".py")]
+
+    def script(call):
+        return os.path.basename(call[-1].split()[-1])
+    assert script(launched("gui-gtk", "GUI=gtk\n")) == "gui_gtk.py"
+    assert script(launched("gui-qt", "GUI=qt\n")) == "gui.py"
+    assert script(launched("gui-none", "")) == "gui.py", "конфігурація без GUI — це встановлення Qt"
+    assert script(launched("gui-no-gtk", "GUI=gtk\n", gtk=1)) == "gui.py", "GTK немає — Qt"
+    assert script(launched("gui-no-qt", "GUI=qt\n", qt=1)) == "gui_gtk.py", "Qt немає — GTK"
+    assert launched("gui-off", "GUI=none\n") == [], "без вікна — і запасного вікна немає"
+    sb = Sandbox(root, "gui-set", "GNOME")
+    assert sb.run("set", "GUI", "gtk")[0] == 0
+    assert sb.run("set", "GUI", "tk")[0] != 0, "лише qt або gtk"
+    with open(os.path.join(sb.home, ".config", "cd-auto-runner", "config"), encoding="utf-8") as f:
+        assert "GUI=gtk\n" in f.read(), "вибір зберігається"
+    # вбудований програвач живе у вікні, тож разом із ним зникає вибір програвача
+    sb = Sandbox(root, "gui-builtin", "GNOME")
+    cfg = os.path.join(sb.home, ".config", "cd-auto-runner", "config")
+    os.makedirs(os.path.dirname(cfg))
+    with open(cfg, "w") as f:
+        f.write("PLAYER_ID=builtin\nPLAYER_NAME=Built-in\n")
+    assert sb.run("set", "GUI", "none")[0] == 0
+    with open(cfg, encoding="utf-8") as f:
+        text = f.read()
+    assert "GUI=none\n" in text and "PLAYER_ID=\n" in text, text
+    assert "builtin" not in sb.run("list")[1]
+
+
+def check_whole_disc(root):
+    """Decibels відкриває лише один файл: увесь диск — один WAV, потрекові файли лишаються."""
+    sb = Sandbox(root, "whole", "GNOME", ("player",))
+    stub(sb.stubs, "udevadm", "echo ID_CDROM_MEDIA_TRACK_COUNT_AUDIO=2")
+    stub(sb.stubs, "cd-paranoia", r'''
+if [[ "$1" == -Q ]]; then
+  echo "  1.        3 [00:00.03]        0 [00:00.00]    no   no  2"
+  echo "  2.        2 [00:00.02]        3 [00:00.03]    no   no  2"
+else
+  n=$(( $6 == 1 ? 7056 : 4704 ))
+  head -c "$n" /dev/zero | tr '\0' "$6"
+fi''')
+    env = dict(sb.env, CDAR_LIB=os.path.join(ROOT, "players", "_lib.sh"), CDAR_DEVICE="/dev/sr0", CDAR_TRACKS="2",
+               CDAR_EXEC="player %U", CDAR_NAME="Audio Player", CDAR_NOTIFY="no", CDAR_DRY_RUN="0", CDAR_RIP_FORMAT="wav",
+               CDAR_LIBRARY="no", CDAR_ONLINE="no", CDAR_I18N=os.path.join(ROOT, "i18n.sh"), CDAR_UI_LANG="en")
+
+    def adapter():
+        p = subprocess.run(["bash", os.path.join(ROOT, "players", "decibels.sh")], env=env, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=30)
+        opened = [c for c in sb.calls() if c.startswith("player ")]
+        assert p.returncode == 0 and len(opened) == 1, (p.stderr, opened)
+        path = opened[0].split(" ", 1)[1]
+        assert os.path.basename(path) == "album.wav", "один файл, а не список треків"
+        with open(path, "rb") as f:
+            data = f.read()
+        assert data.endswith(b"1" * 7056 + b"2" * 4704), "треки підряд"
+        assert data[:4] == b"RIFF" and b"data" in data and len(data) - data.index(b"data") - 8 == 7056 + 4704
+        return path
+
+    path = adapter()
+    folder = os.path.dirname(path)
+    assert sum(n.endswith(".wav") for n in os.listdir(folder)) == 3, "потрекові файли — для бібліотеки"
+    # диск уже скопійовано: album.wav складається з кешу, без читання диска
+    os.remove(path)
+    open(sb.log, "w").close()
+    assert adapter() == path
+    assert not any(c.startswith("cd-paranoia") and "-d /dev/sr0 " in c and "-Q" not in c for c in sb.calls()), sb.calls()
+
+
 def check_sections(root):
     """Картки налаштувань типово згорнуті й пам'ятають стан; ключ не залежить від мови."""
     code = r'''
@@ -227,7 +304,7 @@ assert not box.body.isHidden(), "стан збережено"
 def main():
     with tempfile.TemporaryDirectory() as root:
         for check in (check_dialogs, check_terminal, check_launch, check_eject, check_gnome_autorun, check_own_entry,
-                      check_sections):
+                      check_gui_choice, check_whole_disc, check_sections):
             check(root)
             print(f"ok {check.__name__}")
     check_icons()

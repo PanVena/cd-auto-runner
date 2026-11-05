@@ -13,7 +13,6 @@ SPDX-License-Identifier: GPL-2.0-only
 Copyright (C) 2026 Pan Vena
 """
 import os
-import re
 import sys
 
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
@@ -23,64 +22,8 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QTableWidgetItem, QVBoxLayout,
 )
 
-LANG = os.environ.get("CDAR_UI_LANG", "uk")
-EN = {
-    "Назви треків": "Track titles",
-    "Альбом:": "Album:",
-    "Виконавець альбому:": "Album artist:",
-    "Рік:": "Year:",
-    "порожньо — визначиться сам (для збірки — Various Artists)":
-        "empty — detected automatically (Various Artists for a compilation)",
-    "Виконавець": "Artist",
-    "Назва": "Title",
-    "Вставити список…": "Paste tracklist…",
-    "Очистити": "Clear",
-    "Додати диск у MusicBrainz": "Add the disc to MusicBrainz",
-    "Зберегти": "Save",
-    "Скасувати": "Cancel",
-    "Вставте список треків — по одному в рядку, наприклад «1. Виконавець - Назва».\n"
-    "Номери на початку рядків і порожні рядки пропускаються.":
-        "Paste the tracklist — one track per line, e.g. \"1. Artist - Title\".\n"
-        "Leading numbers and empty lines are skipped.",
-    "Для збірки (диск із журналу) вкажіть виконавця кожного треку. "
-    "Якщо виконавець той самий, що й в альбому, стовпчик можна лишити порожнім.":
-        "For a compilation (e.g. a magazine CD) enter the artist of every track. "
-        "If it's the same as the album artist, the column can stay empty.",
-}
-
-
-def _(text):
-    return EN.get(text, text) if LANG == "en" else text
-
-
-# «Виконавець - Назва»; пробіл може бути лише з одного боку дефіса, «Jay-Z» не розбивається
-SPLIT = (re.compile(r"^(.*\S)\s+-\s*(\S.*)$"), re.compile(r"^(.*\S)\s*-\s+(\S.*)$"))
-LEADING_NUMBER = re.compile(r"^\s*(?:\d{1,3}\s*[.):\-–]?\s+|\d{1,3}[.)]\s*)")
-
-
-def split_track(value):
-    value = value.strip()
-    for rx in SPLIT:
-        m = rx.match(value)
-        if m:
-            return m.group(1), m.group(2)
-    return "", value
-
-
-def read_template(path):
-    head, tracks = {}, {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line or line.lstrip().startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            if re.fullmatch(r"\d\d", key):
-                tracks[int(key)] = split_track(value)
-            else:
-                head[key] = value
-    return head, tracks
-
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))     # запуск з -I: спільний модуль лежить поруч
+from _tagger_common import _, parse_list, read_template, write_template     # noqa: E402
 
 class PasteDialog(QDialog):
     def __init__(self, parent):
@@ -104,12 +47,7 @@ class PasteDialog(QDialog):
         self.resize(560, 420)
 
     def tracks(self):
-        result = []
-        for line in self.text.toPlainText().splitlines():
-            line = LEADING_NUMBER.sub("", line).strip()
-            if line:
-                result.append(split_track(line))
-        return result
+        return parse_list(self.text.toPlainText())
 
 
 class CellDelegate(QStyledItemDelegate):
@@ -217,17 +155,8 @@ class Tagger(QDialog):
                 self.table.item(r, c).setText("")
 
     def save(self):
-        lines = [
-            f"ALBUM={self.album.text().strip()}",
-            f"ALBUM_ARTIST={self.album_artist.text().strip()}",
-            f"YEAR={self.year.text().strip()}",
-        ]
-        for r in range(self.table.rowCount()):
-            artist = self.table.item(r, 0).text().strip()
-            name = self.table.item(r, 1).text().strip()
-            lines.append(f"{r + 1:02d}=" + (f"{artist} - {name}" if artist and name else name or artist))
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        rows = [(self.table.item(r, 0).text(), self.table.item(r, 1).text()) for r in range(self.table.rowCount())]
+        write_template(self.path, self.album.text(), self.album_artist.text(), self.year.text(), rows)
         self.accept()
 
 

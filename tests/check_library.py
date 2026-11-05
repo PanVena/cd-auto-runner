@@ -10,9 +10,16 @@ import subprocess
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-spec = importlib.util.spec_from_file_location("gui", os.path.join(ROOT, "gui", "gui.py"))
-gui = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(gui)
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, "gui", f"{name}.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+core = load("cdar_core")
 
 
 def touch(folder, *names):
@@ -24,81 +31,81 @@ def touch(folder, *names):
 def check_digital_album(root):
     folder = os.path.join(root, "Artist", "Digital")
     touch(folder, "b side.m4a", "a side.m4a", "cover.txt")
-    album = gui.read_album(folder, root)
+    album = core.read_album(folder, root)
     assert [t["title"] for t in album["tracks"]] == ["a side", "b side"], "формати цифрових копій"
     assert album["ALBUM_ARTIST"] == "Artist", "виконавець — батьківська тека"
     assert album["SOURCE"] == "digital"
 
     # порядок і назви з мітки, файли з номера не беруться
-    gui.write_marker(folder, {"ALBUM": "Named", "ALBUM_ARTIST": "Artist", "YEAR": "2001"},
+    core.write_marker(folder, {"ALBUM": "Named", "ALBUM_ARTIST": "Artist", "YEAR": "2001"},
                      [(1, "b side.m4a", "", "First"), (2, "a side.m4a", "Guest", "Second")])
-    album = gui.read_album(folder, root)
+    album = core.read_album(folder, root)
     assert (album["ALBUM"], album["YEAR"]) == ("Named", "2001")
     assert [(t["artist"], t["title"]) for t in album["tracks"]] == [("Artist", "First"), ("Guest", "Second")]
     assert os.path.basename(album["tracks"][0]["path"]) == "b side.m4a"
 
     # файл, доданий пізніше, — у кінець; збережені назви не з'їжджають
     touch(folder, "a new.m4a")
-    tracks = gui.read_album(folder, root)["tracks"]
+    tracks = core.read_album(folder, root)["tracks"]
     assert [t["title"] for t in tracks] == ["First", "Second", "a new"], tracks
 
 
 def check_ripped_album(root):
     folder = os.path.join(root, "Artist", "Ripped")
     touch(folder, "01 - One.flac", "03 - Three.flac")
-    with open(os.path.join(folder, gui.MARKER), "w", encoding="utf-8") as f:
+    with open(os.path.join(folder, core.MARKER), "w", encoding="utf-8") as f:
         f.write("# cd-auto-runner\nDISCID=abc\nALBUM=Ripped\nALBUM_ARTIST=Artist\n01=One\n03=Three\n")
-    assert [t["num"] for t in gui.read_album(folder, root)["tracks"]] == [1, 3], "нумерація диска"
-    assert gui.read_album(folder, root)["SOURCE"] == "ripped"
-    gui.write_marker(folder, {"ALBUM": "New", "ALBUM_ARTIST": "Artist", "YEAR": ""},
+    assert [t["num"] for t in core.read_album(folder, root)["tracks"]] == [1, 3], "нумерація диска"
+    assert core.read_album(folder, root)["SOURCE"] == "ripped"
+    core.write_marker(folder, {"ALBUM": "New", "ALBUM_ARTIST": "Artist", "YEAR": ""},
                      [(1, "", "", "Uno"), (3, "", "", "Tres")])
-    meta = gui.read_marker(folder)
+    meta = core.read_marker(folder)
     assert meta["DISCID"] == "abc", "мітка не втрачає диск"
-    assert gui.read_album(folder, root)["SOURCE"] == "ripped", "редагування не робить альбом цифровим"
-    assert [t["title"] for t in gui.read_album(folder, root)["tracks"]] == ["Uno", "Tres"]
+    assert core.read_album(folder, root)["SOURCE"] == "ripped", "редагування не робить альбом цифровим"
+    assert [t["title"] for t in core.read_album(folder, root)["tracks"]] == ["Uno", "Tres"]
     assert not any(k.startswith("F") for k in meta), "у диска порядок задано номерами"
 
 
 def check_playlist(root):
     folder = os.path.join(root, "Artist", "Ripped")
     one, three = os.path.join(folder, "01 - One.flac"), os.path.join(folder, "03 - Three.flac")
-    path = os.path.join(gui.playlists_dir(root), "Mix" + gui.PLAYLIST_EXT)
-    gui.write_m3u(path, [(three, "x"), (one, "y")])
+    path = os.path.join(core.playlists_dir(root), "Mix" + core.PLAYLIST_EXT)
+    core.write_m3u(path, [(three, "x"), (one, "y")])
     with open(path, encoding="utf-8") as f:
         assert "../Artist/Ripped/03 - Three.flac" in f.read().splitlines(), "шляхи відносні"
-    assert gui.read_m3u(path) == [(three, "x"), (one, "y")], "порядок зберігається"
+    assert core.read_m3u(path) == [(three, "x"), (one, "y")], "порядок зберігається"
 
-    entry = gui.read_entry(path, root)
+    entry = core.read_entry(path, root)
     assert [t["title"] for t in entry["tracks"]] == ["Tres", "Uno"], "назви з альбому, порядок — плейліста"
     assert [(t["n"], t["num"]) for t in entry["tracks"]] == [(1, 1), (2, 2)]
     assert entry["tracks"][0]["album"] == "New"
     assert entry["ALBUM"] == "Mix"
 
     # трек зник — лишається в списку під своїм підписом
-    gui.write_m3u(path, [(os.path.join(folder, "gone.flac"), "Old Band - Old Song"), (one, "y")])
-    missing, present = gui.read_playlist(path, root)["tracks"]
+    core.write_m3u(path, [(os.path.join(folder, "gone.flac"), "Old Band - Old Song"), (one, "y")])
+    missing, present = core.read_playlist(path, root)["tracks"]
     assert missing.get("missing") and (missing["artist"], missing["title"]) == ("Old Band", "Old Song")
     assert "missing" not in present
 
     # плейліст не стає альбомом, «Улюблене» є без файлу й іде першим
-    assert all(a["ALBUM_DIR"] != gui.playlists_dir(root) for a in gui.scan_library(root))
-    names = [p["PLAYLIST"] for p in gui.list_playlists(root)]
-    assert names == [gui.favorites_path(root), path], names
-    assert gui.read_playlist(gui.favorites_path(root), root)["tracks"] == []
-    assert gui.safe_name(" ../a\\b ") == "-a-b", "назва — це ім'я файлу"
+    assert all(a["ALBUM_DIR"] != core.playlists_dir(root) for a in core.scan_library(root))
+    names = [p["PLAYLIST"] for p in core.list_playlists(root)]
+    assert names == [core.favorites_path(root), path], names
+    assert core.read_playlist(core.favorites_path(root), root)["tracks"] == []
+    assert core.safe_name(" ../a\\b ") == "-a-b", "назва — це ім'я файлу"
 
 
 def check_relink(root):
     """_cdar_relink_playlists: перейменований під час «Ввести назви» трек не губиться з плейлістів."""
-    path = os.path.join(gui.playlists_dir(root), "Relink" + gui.PLAYLIST_EXT)
+    path = os.path.join(core.playlists_dir(root), "Relink" + core.PLAYLIST_EXT)
     old, new = os.path.join(root, "Old [x]", "01 - A.flac"), os.path.join(root, "New", "01 - B.flac")
     other = os.path.join(root, "Keep", "02 - C.flac")
-    gui.write_m3u(path, [(old, "a"), (other, "c")])
+    core.write_m3u(path, [(old, "a"), (other, "c")])
     subprocess.run(["bash", "-c", 'source "$1"; _cdar_relink_playlists "$2" "$3"', "_",
                     os.path.join(ROOT, "players", "_lib.sh"), old, new], check=True,
                    env=dict(os.environ, CDAR_LIBRARY_DIR=root, CDAR_EXEC="true", CDAR_DEVICE="/dev/null",
                             CDAR_TRACKS="1", CDAR_NAME="test"))
-    assert [e[0] for e in gui.read_m3u(path)] == [new, other]
+    assert [e[0] for e in core.read_m3u(path)] == [new, other]
     assert not os.path.exists(path + ".part")
 
 
@@ -142,5 +149,6 @@ with tempfile.TemporaryDirectory() as tmp:
     library = os.path.join(tmp, "Музика")
     for check in (check_digital_album, check_ripped_album, check_playlist, check_relink):
         check(library)
+gui = load("gui")
 check_mosaic()
 print("бібліотека: гаразд / library: ok")

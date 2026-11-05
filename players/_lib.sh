@@ -699,15 +699,19 @@ _cdar_info_item() {
 # _cdar_wav_prealloc <файл> <трек>: заголовок WAV з тегами (INFO) + файл повного розміру.
 # Виводить довжину заголовка — з цього місця cd-paranoia дописує звук.
 _cdar_wav_prealloc() {
-  local out="$1" t="$2" data info hdr
-  data=$(( ${CDAR_SECTORS[t-1]} * 2352 ))
+  _cdar_wav_create "$1" $(( ${CDAR_SECTORS[$2-1]} * 2352 )) "${CDAR_TITLES[$2-1]}" "${CDAR_ARTISTS[$2-1]}" "$2"
+}
+
+# _cdar_wav_create <файл> <байтів звуку> <назва> <виконавець> [трек]
+_cdar_wav_create() {
+  local out="$1" data="$2" info hdr
   info="$(mktemp)"
   {
     printf 'INFO'
-    _cdar_info_item INAM "${CDAR_TITLES[t-1]}"
-    _cdar_info_item IART "${CDAR_ARTISTS[t-1]}"
+    _cdar_info_item INAM "$3"
+    _cdar_info_item IART "$4"
     _cdar_info_item IPRD "$CDAR_ALBUM"
-    _cdar_info_item ITRK "$t"
+    _cdar_info_item ITRK "${5:-}"
     _cdar_info_item ICRD "$CDAR_YEAR"
   } > "$info"
   local isz; isz=$(stat -c %s "$info")
@@ -722,6 +726,38 @@ _cdar_wav_prealloc() {
   hdr=$(stat -c %s "$out")
   truncate -s $(( hdr + data )) "$out"
   echo "$hdr"
+}
+
+# --- увесь диск одним файлом (CDAR_WHOLE=1) ----------------------------------
+# Для програвачів, що відкривають лише один файл (Decibels). Копіювання те саме, потрекове
+# (бібліотека, повторне вставлення диска), а звук заодно пишеться в album.wav на своє місце.
+_cdar_whole_offset() {  # <трек> → байт, з якого в album.wav починається цей трек
+  local i off="$CDAR_WHOLE_HDR"
+  for ((i = 0; i < $1 - 1; i++)); do off=$(( off + CDAR_SECTORS[i] * 2352 )); done
+  echo "$off"
+}
+
+_cdar_whole_prepare() {  # <тека диска>
+  local dir="$1" i data=0
+  CDAR_WHOLE_FILE="$dir/album.wav"
+  for ((i = 0; i < CDAR_TRACKS; i++)); do data=$(( data + CDAR_SECTORS[i] * 2352 )); done
+  if [[ -s "$CDAR_WHOLE_FILE" && -s "$dir/.whole-hdr" ]]; then
+    CDAR_WHOLE_HDR="$(cat "$dir/.whole-hdr")"
+  else
+    rm -f -- "$dir"/.whole-*
+    CDAR_WHOLE_HDR="$(_cdar_wav_create "$CDAR_WHOLE_FILE" "$data" "$CDAR_ALBUM" "$CDAR_ALBUM_ARTIST")"
+    echo "$CDAR_WHOLE_HDR" > "$dir/.whole-hdr"
+  fi
+}
+
+# Трек, скопійований раніше (WAV у кеші або закодований у бібліотеці) → в album.wav
+_cdar_whole_fill() {  # <тека диска> <трек> <файл>
+  local data=$(( CDAR_SECTORS[$2-1] * 2352 ))
+  [[ -e "$1/.whole-$2" ]] && return 0
+  { if [[ "$3" == *.wav ]]; then tail -c "$data" -- "$3"
+    else ffmpeg -nostdin -v error -i "$3" -f s16le -ar 44100 -ac 2 - 2>/dev/null | head -c "$data"; fi
+  } | dd of="$CDAR_WHOLE_FILE" conv=notrunc seek="$(_cdar_whole_offset "$2")B" bs=64K status=none \
+    && touch "$1/.whole-$2"
 }
 
 # Скільки байтів уже записав dd (позиція дескриптора 1)
@@ -825,8 +861,14 @@ _cdar_next_track() {
 _cdar_rip_into() {
   local t="$1" out="$2" hdr="$3" on_ready="${4:-}" ready=0 n=0 p k
   ( set -o pipefail
-    "$CDAR_RIPPER" -q -Z -r -d "$CDAR_DEVICE" "$t" - 2>/dev/null \
-      | dd of="$out" conv=notrunc seek="${hdr}B" bs=64K status=none ) &
+    if ((${CDAR_WHOLE:-0})); then
+      "$CDAR_RIPPER" -q -Z -r -d "$CDAR_DEVICE" "$t" - 2>/dev/null \
+        | tee >(dd of="$CDAR_WHOLE_FILE" conv=notrunc seek="$(_cdar_whole_offset "$t")B" bs=64K status=none) \
+        | dd of="$out" conv=notrunc seek="${hdr}B" bs=64K status=none
+    else
+      "$CDAR_RIPPER" -q -Z -r -d "$CDAR_DEVICE" "$t" - 2>/dev/null \
+        | dd of="$out" conv=notrunc seek="${hdr}B" bs=64K status=none
+    fi ) &
   p=$!
   while kill -0 "$p" 2>/dev/null; do
     if [[ -n "$on_ready" ]] && ((!ready)) && (( $(_cdar_written "$p") >= hdr + ${CDAR_PREBUFFER:-1048576} )); then
@@ -907,6 +949,7 @@ cdar_rip_and_play() {
       [[ "${CDAR_LIBRARY:-yes}" == yes ]] && echo "#   → $root/<$(_ 'Виконавець')>/<$(_ 'Альбом')>/$(printf '%02d' "$t") - <$(_ 'Назва')>.$fmt"
       show+=("$base/disc-ID/$(printf '%02d' "$t").wav")
     done
+    ((${CDAR_WHOLE:-0})) && show=("$base/disc-ID/album.wav")
     [[ "$CDAR_MODE" == play ]] && "$open_fn" "${show[@]}"
     return 0
   fi
@@ -960,11 +1003,19 @@ cdar_rip_and_play() {
       play[t]="${wav[t]}"                           # уже в кеші
       [[ -n "$lib" ]] && encode+=("$t")             # лишилося закодувати
     else
-      rm -f -- "$dir/.done-$t"
+      rm -f -- "$dir/.done-$t" "$dir/.whole-$t"
       hdr[t]="$(_cdar_wav_prealloc "${wav[t]}" "$t")"
       play[t]="${wav[t]}"; CDAR_TODO[$t]=1
     fi
   done
+
+  if ((${CDAR_WHOLE:-0})); then
+    _cdar_whole_prepare "$dir"
+    for ((t = 1; t <= CDAR_TRACKS; t++)); do
+      [[ -n "${CDAR_TODO[$t]:-}" ]] || _cdar_whole_fill "$dir" "$t" "${play[t]}"
+    done
+    play=("$CDAR_WHOLE_FILE")
+  fi
 
   CDAR_OPENED=0
   _cdar_open_all() {
@@ -995,6 +1046,7 @@ cdar_rip_and_play() {
     else _cdar_rip_into "$t" "${wav[t]}" "${hdr[t]}"; rc=$?; fi
     case "$rc" in
       0) touch "$dir/.done-$t"; unset "CDAR_TODO[$t]"; cur=$((t + 1))
+         ((${CDAR_WHOLE:-0})) && touch "$dir/.whole-$t"
          if [[ -n "$lib" ]]; then
            _cdar_encode "${wav[t]}" "${final[t]}" "$fmt" "$t" keep || cdar_log "$(_ 'не вдалося закодувати трек %s' "$t")"
          fi ;;
