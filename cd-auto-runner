@@ -6,7 +6,7 @@
 # Copyright (C) 2026 Pan Vena
 set -uo pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.5"
 APP="cd-auto-runner"
 APP_TITLE="CD Auto Runner"
 ICON="media-optical-audio"
@@ -756,6 +756,12 @@ cmd_perm() {
 
 # open [-n] [-p ID] ФАЙЛ… → відкрити файли (альбом бібліотеки) в обраному програвачі.
 # Адаптер отримує їх у CDAR_FILES, по одному шляху на рядок.
+# musicbrainz --list|--release|--cover … → пошук для редактора альбому (players/_mbsearch.py)
+cmd_musicbrainz() {
+  load_adapters
+  exec python3 -I "$(dirname "$CDAR_LIB")/_mbsearch.py" "$@"
+}
+
 cmd_open() {
   local dry=0 want="" f list="" i adapter
   local -a files=()
@@ -1116,6 +1122,7 @@ main() {
     info)               cmd_info "$@" ;;
     play)               cmd_play "$@" ;;
     open)               cmd_open "$@" ;;
+    musicbrainz)        cmd_musicbrainz "$@" ;;
     watch|daemon)       cmd_watch ;;
     status)             cmd_status ;;
     list)               cmd_list ;;

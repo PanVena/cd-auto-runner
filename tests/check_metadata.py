@@ -109,6 +109,24 @@ def check_lengths():
     assert mbsearch.matching_medium({"media": [{"format": "Vinyl", "tracks": tracks}]}, [100000, 200000]) is None
 
 
-for check in (check_cdtext, check_cdtext_drive_errors, check_candidates, check_lengths):
+def check_digital_search():
+    """Пошук для цифрових копій: кількість треків підіймає реліз, а не відсіює його."""
+    found = [release(id="more", media=[{"format": "CD", "track-count": 16}]),
+             release(id="same", score=90, media=[{"format": "Digital Media", "track-count": 11}]),
+             release(id="double", score=80, media=[{"format": "CD", "track-count": 11}, {"format": "CD", "track-count": 5}])]
+    get, mbsearch.get = mbsearch.get, lambda *_a, **_k: {"releases": found}
+    try:
+        assert [r["id"] for r in mbsearch.find_releases("UADA", "Djinn", 11)] == ["same", "double", "more"]
+        assert mbsearch.find_releases("", "", 11) == [], "порожній запит"
+    finally:
+        mbsearch.get = get
+    assert mbsearch.loose('Blood [FLAC: 2011]') == "(Blood FLAC 2011)", "без синтаксису Lucene"
+    assert mbsearch.release_query("", "A", mbsearch.phrase) == 'release:"A"'
+    double = {"media": [{"tracks": [1, 2]}, {"tracks": [3, 4, 5]}]}
+    assert mbsearch.pick_tracks(double, 3) == [3, 4, 5], "тека на один диск"
+    assert mbsearch.pick_tracks(double, 4) == [1, 2, 3, 4, 5], "усі диски підряд"
+
+
+for check in (check_cdtext, check_cdtext_drive_errors, check_candidates, check_lengths, check_digital_search):
     check()
 print("метадані: гаразд / metadata: ok")

@@ -582,6 +582,20 @@ _cdar_track_stem() {
   fi
 }
 
+# Плейлісти посилаються на файли: трек перейменовано — посилання на нього оновлюємо.
+# Плейлісти лежать на рівень нижче від кореня бібліотеки (gui.py, PLAYLIST_DIR).
+_cdar_relink_playlists() {  # _cdar_relink_playlists <старий файл> <новий файл>
+  local root list tmp
+  root="$(_cdar_library_root)"
+  for list in "$root/Playlists/"*.m3u8; do
+    [[ -f "$list" ]] && grep -qxF -- "../${1#"$root/"}" "$list" || continue
+    tmp="$list.part"
+    OLD="../${1#"$root/"}" NEW="../${2#"$root/"}" \
+      awk '$0 == ENVIRON["OLD"] { print ENVIRON["NEW"]; next } { print }' "$list" > "$tmp" \
+      && mv -f -- "$tmp" "$list"
+  done
+}
+
 # Після зміни назв: переносить уже скопійовані треки зі старої теки бібліотеки в нову,
 # перейменовує їх і переписує теги (без перекодування). Порожні старі теки видаляє.
 _cdar_retag_library() {
@@ -605,7 +619,7 @@ _cdar_retag_library() {
       if ffmpeg -nostdin -hide_banner -loglevel error -y -i "$f" -map 0 -c copy "${meta[@]}" \
            -f "$(case "$ext" in opus|ogg) echo ogg ;; *) echo "$ext" ;; esac)" "$out.part" \
          && mv -f -- "$out.part" "$out"; then
-        [[ "$f" -ef "$out" ]] || rm -f -- "$f"
+        [[ "$f" -ef "$out" ]] || { rm -f -- "$f"; _cdar_relink_playlists "$f" "$out"; }
       else
         rm -f -- "$out.part"; cdar_log "$(_ 'не вдалося оновити теги: %s' "$f")"
       fi
