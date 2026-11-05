@@ -3,7 +3,9 @@
 **English** · [Українська](README.uk.md)
 
 Automatically starts **the player of your choice** as soon as an **audio CD** is inserted.
-Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
+Made for KDE Plasma 6 and GNOME, and works in any Linux desktop with udev and systemd.
+
+Tested on Fedora 44 and 45 with GNOME 50 and KDE Plasma 6.7 and 6.8.
 
 ## Features
 
@@ -11,8 +13,8 @@ Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
 - Picks up players installed on your system (including Flatpak and Snap) and preselects your default music player.
 - Rips the disc to your Music folder while it plays (FLAC, Opus, Ogg, MP3 or WAV), with tags and cover art.
 - Gets track titles from MusicBrainz or from the disc itself (CD-TEXT); if neither has them, lets you enter them yourself. A disc MusicBrainz doesn't know by its ID is looked up by name and track lengths, for the cover and the year.
-- Adds actions to Plasma's **Disks & Devices** menu: play, play in another player, rip, enter titles.
-- App window with the disc, its tracks, playback controls and all settings (PySide6; falls back to `kdialog` or the terminal). It hides to the system tray when closed (an inserted disc can also play straight in the tray, without opening the window), the player has shuffle and repeat, and the built-in player shows up in Plasma's Media Player widget and responds to media keys (MPRIS, needs dbus-python).
+- In Plasma, adds actions to the **Disks & Devices** menu: play, play in another player, rip, enter titles. In GNOME, the same actions are in the app icon's menu (right click in the dock or app grid), and the app shows up as a choice for CD audio in Settings. Eject works even while GNOME holds the disc mounted.
+- App window with the disc, its tracks, playback controls and all settings (PySide6; falls back to `kdialog`, `zenity` or the terminal). It hides to the system tray when closed (an inserted disc can also play straight in the tray, without opening the window), the player has shuffle and repeat, and the built-in player shows up in your desktop's media controls and responds to media keys (MPRIS, needs dbus-python). Stock GNOME has no tray: while music is playing, closing the window leaves it playing, and the app menu brings the window back; for a tray icon, install the AppIndicator extension.
 - Works as a regular player too: the **Library** card lists albums you've ripped, and one opens in your chosen player, in place of the inserted disc or with no disc in the drive at all (a custom command can't take files, so with it albums play in the window). Inserting a disc that autoplays takes over from the album.
 - **Playlists** are a separate tab next to the library: they look just like albums but only link to tracks, so they take no extra disk space. The cover is combined from up to four different albums in the playlist, or you can choose your own. The Favorites playlist is always there, and the heart button in the player adds the current track to it. Reorder tracks by dragging rows or with Move up / Move down; add tracks from the track or album context menu (right click). Playlists live in the library's `Playlists` folder as `.m3u8` files with relative paths, so other players can read them too.
 - **Your own albums from digital copies**: put a folder of music into the library (FLAC, MP3, Opus, Ogg, M4A, WMA, APE, WavPack, WAV, AIFF) and the album appears in the window by itself. "Edit album" reads the file tags, finds the release on MusicBrainz with its year and cover art, or lets you fill everything in by hand and arrange the tracks. Tiles of albums ripped from a disc carry a small disc mark; digital albums do not. Changes are stored in the hidden `.cd-auto-runner` file and `cover.jpg` in the album folder: the audio files stay untouched.
@@ -22,12 +24,18 @@ Made for KDE Plasma 6, but works in any Linux desktop with udev and systemd.
 ## Installation
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/PanVena/cd-auto-runner/main/install.sh | bash
+```
+
+Or from a clone:
+
+```bash
 git clone https://github.com/PanVena/cd-auto-runner.git
 cd cd-auto-runner
 ./install.sh
 ```
 
-The installer asks for the language and the player, installs `mpv` (the engine of the built-in player), offers to install optional dependencies (`kdialog`, `notify-send`, `cd-paranoia`, `ffmpeg`, PySide6, dbus-python) and starts the service. Everything is installed for the current user; `sudo` is needed only for the dependencies. Run `./install.sh --help` for options.
+The installer asks for the language and the player, installs `mpv` (the engine of the built-in player), offers to install optional dependencies (`kdialog` in Plasma or `zenity` elsewhere, `notify-send`, `cd-paranoia`, `ffmpeg`, PySide6, dbus-python) and starts the service. In GNOME it also offers to hand audio CD autoplay to the app, so that GNOME doesn't ask what to do or start a second player; `cd-auto-runner gnome-autorun off` and uninstalling put your settings back. Everything is installed for the current user; `sudo` is needed only for the dependencies. Run `./install.sh --help` for options; with `curl`, pass them after `bash -s --`.
 
 ## Usage
 
@@ -38,10 +46,12 @@ cd-auto-runner play [/dev/sr0] start the player manually
 cd-auto-runner open FILE...    open files in the chosen player
 cd-auto-runner rip             rip the disc to the music library without playing
 cd-auto-runner tag             enter track titles
+cd-auto-runner eject           eject the disc
 cd-auto-runner stop            stop ripping
 cd-auto-runner status          settings, service and drive state
 cd-auto-runner lang [uk|en]    interface language
 cd-auto-runner enable|disable  enable/disable the service
+cd-auto-runner gnome-autorun on|off  hand CD autoplay to the app or back to GNOME
 ```
 
 Settings are stored in `~/.config/cd-auto-runner/config`. A custom player command can use `{dev}` for the drive path, e.g. `vlc cdda://{dev}`.
@@ -61,7 +71,7 @@ To add a player, copy an adapter from `players/` to `~/.config/cd-auto-runner/pl
 ## Uninstall
 
 ```bash
-./uninstall.sh          # --purge also removes the settings
+~/.local/share/cd-auto-runner/uninstall.sh   # --purge also removes the settings
 ```
 
 Ripped albums in your Music folder are kept.

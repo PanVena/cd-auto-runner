@@ -142,7 +142,7 @@ class Tagger(QDialog):
         count = max(tracks) if tracks else 0
 
         self.setWindowTitle(f"CD Auto Runner — {title or _('Назви треків')}")
-        self.setWindowIcon(QIcon.fromTheme("media-optical-audio"))
+        self.setWindowIcon(QIcon.fromTheme("cd-auto-runner", QIcon.fromTheme("media-optical-audio")))
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
@@ -238,6 +238,10 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("cd-auto-runner")
     app.setDesktopFileName("cd-auto-runner")
+    if "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":") and app.font().pointSizeF() >= 11:
+        font = app.font()       # той самий розмір, що й у головному вікні
+        font.setPointSizeF(font.pointSizeF() - 1)
+        app.setFont(font)
     dialog = Tagger(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "",
                     sys.argv[3] if len(sys.argv) > 3 else "")
     return 0 if dialog.exec() == QDialog.Accepted else 1

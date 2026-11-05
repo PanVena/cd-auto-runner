@@ -1,21 +1,23 @@
 #!/usr/bin/env bash
 # cd-auto-runner — автоматично запускає обраний програвач, коли вставлено аудіо-CD.
-# Працює в KDE Plasma (і будь-якому іншому середовищі з udev + systemd).
+# Працює в KDE Plasma, GNOME і будь-якому іншому середовищі з udev + systemd.
 #
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Pan Vena
 set -uo pipefail
 
-VERSION="1.2.5"
+VERSION="1.3.1"
 APP="cd-auto-runner"
 APP_TITLE="CD Auto Runner"
-ICON="media-optical-audio"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
 CONFIG_FILE="$CONFIG_DIR/config"
 SERVICE="$APP.service"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
 SOLID_FILE="$DATA_DIR/solid/actions/$APP.desktop"
+# Власний значок є після встановлення; у запуску з репозиторію — значок теми
+ICON="$APP"
+[[ -f "$DATA_DIR/icons/hicolor/scalable/apps/$APP.svg" ]] || ICON="media-optical-audio"
 
 # Переклад інтерфейсу (i18n.sh): тексти в коді — українською, _ повертає переклад.
 # Мова: CDAR_UI_LANG → UI_LANG у налаштуваннях → мова системи.
@@ -71,12 +73,115 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 has_display() { [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; }
 
-use_gui() { [[ "${CDAR_TTY:-0}" != 1 ]] && have kdialog && has_display; }
+# Середовище: XDG_CURRENT_DESKTOP — список через двокрапку, напр. ubuntu:GNOME
+desktop_is() { [[ ":${XDG_CURRENT_DESKTOP:-}:" == *":$1:"* ]]; }
+
+# Діалоги: «рідні» для середовища, а якщо їх немає — ті, що є
+DIALOG=""
+if desktop_is KDE; then CDAR_DIALOGS="kdialog zenity"; else CDAR_DIALOGS="zenity kdialog"; fi
+for CDAR_D in $CDAR_DIALOGS; do have "$CDAR_D" && { DIALOG="$CDAR_D"; break; }; done
+
+use_gui() { [[ "${CDAR_TTY:-0}" != 1 && -n "$DIALOG" ]] && has_display; }
+
+# zenity показує --text як розмітку Pango: «&» у назві програвача зламав би діалог
+ui_escape() { local t="${1//&/&amp;}"; t="${t//</&lt;}"; printf '%s' "${t//>/&gt;}"; }
+
+ui_yesno() {  # ui_yesno <питання>
+  if [[ "$DIALOG" == zenity ]]; then
+    zenity --question --no-markup --title="$APP_TITLE" --text="$1" 2>/dev/null
+  else
+    kdialog --title "$APP_TITLE" --yesno "$1"
+  fi
+}
+
+# ui_radiolist <питання> ключ підпис on|off … → обраний ключ
+ui_radiolist() {
+  local q="$1"; shift
+  if [[ "$DIALOG" == kdialog ]]; then
+    kdialog --title "$APP_TITLE" --icon "$ICON" --radiolist "$q" "$@"
+    return
+  fi
+  local -a rows=()
+  while (($#)); do rows+=("$([[ "$3" == on ]] && echo TRUE || echo FALSE)" "$1" "$2"); shift 3; done
+  zenity --list --radiolist --title="$APP_TITLE" --text="$(ui_escape "$q")" --width=680 --height=440 \
+    --hide-header --column=- --column=- --column=- --hide-column=2 --print-column=2 "${rows[@]}" 2>/dev/null
+}
+
+# ui_menu <питання> ключ підпис … → обраний ключ
+ui_menu() {
+  local q="$1"; shift
+  if [[ "$DIALOG" == kdialog ]]; then
+    kdialog --title "$APP_TITLE" --icon "$ICON" --geometry 600x560 --menu "$q" "$@"
+    return
+  fi
+  zenity --list --title="$APP_TITLE" --text="$(ui_escape "$q")" --width=600 --height=560 \
+    --hide-header --column=- --column=- --hide-column=1 --print-column=1 "$@" 2>/dev/null
+}
+
+ui_input() {  # ui_input <підказка> <типове значення>
+  if [[ "$DIALOG" == zenity ]]; then
+    zenity --entry --title="$APP_TITLE" --text="$(ui_escape "$1")" --entry-text="$2" 2>/dev/null
+  else
+    kdialog --title "$APP_TITLE" --inputbox "$1" "$2"
+  fi
+}
+
+ui_directory() {  # ui_directory <початкова тека>
+  if [[ "$DIALOG" == zenity ]]; then
+    zenity --file-selection --directory --title="$APP_TITLE" --filename="${1%/}/" 2>/dev/null
+  else
+    kdialog --title "$APP_TITLE" --getexistingdirectory "$1"
+  fi
+}
+
+ui_message() {  # ui_message <текст> [error]
+  if [[ "$DIALOG" == zenity ]]; then
+    zenity "$([[ "${2:-}" == error ]] && echo --error || echo --info)" --no-markup --title="$APP_TITLE" --text="$1" 2>/dev/null
+  else
+    kdialog --title "$APP_TITLE" "$([[ "${2:-}" == error ]] && echo --sorry || echo --msgbox)" "$1" 2>/dev/null
+  fi
+}
+
+ui_passive() {  # ui_passive <текст>: коротке повідомлення, що не чекає на відповідь
+  if have notify-send; then
+    notify-send -a "$APP_TITLE" -i "$ICON" -h "string:desktop-entry:$APP" "$APP_TITLE" "$1" >/dev/null 2>&1 &
+  elif [[ "$DIALOG" == kdialog ]]; then
+    kdialog --title "$APP_TITLE" --passivepopup "$1" 4 >/dev/null 2>&1 &
+  fi
+}
+
+# Запускає команду у вікні термінала; якщо терміналу немає — повертається.
+# xdg-terminal-exec — стандартний спосіб: враховує вибір користувача.
+run_in_terminal() {
+  local t
+  local -a native=()
+  desktop_is KDE && native=(konsole)
+  desktop_is GNOME && native=(ptyxis kgx gnome-terminal)
+  for t in xdg-terminal-exec "${native[@]}" konsole ptyxis kgx gnome-terminal xfce4-terminal mate-terminal \
+           alacritty foot kitty xterm; do
+    have "$t" || continue
+    case "$t" in
+      xdg-terminal-exec|foot|kitty) exec "$t" "$@" ;;
+      ptyxis|kgx|gnome-terminal)    exec "$t" -- "$@" ;;
+      konsole)                      exec "$t" --hide-menubar -e "$@" ;;
+      xfce4-terminal|mate-terminal) exec "$t" -x "$@" ;;
+      *)                            exec "$t" -e "$@" ;;
+    esac
+  done
+}
+
+# Без діалогів і без терміналу (запуск з меню) — повторюємо команду у вікні термінала
+need_interactive() {  # need_interactive <помилка> <аргументи програми…>
+  use_gui || [[ -t 0 || "${CDAR_TTY:-0}" == 1 ]] && return 0
+  local msg="$1"; shift
+  has_display && run_in_terminal "$SELF" "$@"
+  die "$msg"
+}
 
 notify() {
   [[ "$NOTIFY" == "yes" ]] || return 0
   have notify-send && has_display || return 0
-  notify-send -a "$APP_TITLE" -i "$ICON" "$1" "${2:-}" >/dev/null 2>&1 || true
+  notify-send -a "$APP_TITLE" -i "$ICON" -h "string:desktop-entry:$APP" "$1" "${2:-}" >/dev/null 2>&1 || true
 }
 
 load_config() {
@@ -147,12 +252,12 @@ scan_desktop_entries() {
     for f in "$d"/*.desktop; do [[ -f "$f" ]] && files+=("$f"); done
   done < <(desktop_dirs)
   ((${#files[@]})) || return 0
-  awk -v lang="$lang" -v short="${lang%%_*}" '
+  awk -v lang="$lang" -v short="${lang%%_*}" -v self="$APP.desktop" '
     function flush() {
       if (file == "") return
       if (id in seen) return
       seen[id] = 1
-      if (type != "Application" || hidden == "true" || exec == "") return
+      if (id == self || type != "Application" || hidden == "true" || exec == "") return
       cdda = (";" mime ";") ~ /;x-content\/audio-cdda;/
       cats2 = ";" cats ";"
       player = (cats2 ~ /;Audio;/ || cats2 ~ /;Player;/) && mime ~ /(^|;)audio\// \
@@ -247,7 +352,7 @@ mime_default() {
 # Визначає типовий програвач: DEFAULT_ID і DEFAULT_WHY
 #   0) вбудований програвач (вікно програми + mpv), якщо його можна запустити;
 #   1) явно заданий для Audio CD (x-content/audio-cdda);
-#   2) «Програвач музики» з налаштувань KDE / системи (audio/mpeg, audio/ogg, audio/flac),
+#   2) «Програвач музики» з налаштувань системи (audio/mpeg, audio/ogg, audio/flac),
 #      але лише якщо він точно вміє Audio CD (рівень 1).
 find_default() {
   DEFAULT_ID=""; DEFAULT_WHY=""
@@ -332,7 +437,19 @@ gui_path() {
   done
   return 1
 }
-has_pyside() { python3 -c 'import PySide6.QtWidgets' 2>/dev/null; }
+# Прапорець Python для вікна. -I не бачить site-packages користувача, а саме туди
+# PySide6 ставить pip; тоді -P (Python 3.11+): так само без поточної теки в sys.path.
+PYSIDE_FLAG=unknown
+has_pyside() {
+  if [[ "$PYSIDE_FLAG" == unknown ]]; then
+    PYSIDE_FLAG=none
+    local f
+    for f in -I -P ""; do
+      python3 $f -c 'import PySide6.QtWidgets' 2>/dev/null && { PYSIDE_FLAG="$f"; break; }
+    done
+  fi
+  [[ "$PYSIDE_FLAG" != none ]]
+}
 builtin_available() { have mpv && gui_path >/dev/null && has_pyside; }
 builtin_name() { _ 'CD Auto Runner (вбудований програвач)'; }
 
@@ -384,7 +501,7 @@ fix_flatpak_permissions() {
   fi
   local ok=1
   if use_gui; then
-    kdialog --title "$APP_TITLE" --yesno "$q" && ok=0
+    ui_yesno "$q" && ok=0
   elif [[ -t 0 ]]; then
     read -rp "$q $(yn_hint) " ans; [[ "$ans" =~ ^([нНnN]) ]] || ok=0
   fi
@@ -409,7 +526,7 @@ choose_format() {
   if use_gui; then
     local args=()
     for i in "${!f[@]}"; do args+=("${f[$i]}" "${d[$i]}" "$([[ "${f[$i]}" == "$RIP_FORMAT" ]] && echo on || echo off)"); done
-    pick="$(kdialog --title "$APP_TITLE" --radiolist "$q" "${args[@]}")" || return 1
+    pick="$(ui_radiolist "$q" "${args[@]}")" || return 1
   else
     echo "$q"
     for i in "${!f[@]}"; do
@@ -427,13 +544,7 @@ choose_format() {
 }
 
 cmd_choose() {
-  # Без kdialog і без терміналу (запуск з меню) — відкриваємо Konsole
-  if ! use_gui && [[ ! -t 0 && "${CDAR_TTY:-0}" != 1 ]]; then
-    if have konsole && has_display; then
-      exec konsole --hide-menubar -e "$SELF" choose --tty
-    fi
-    die "$(_ 'немає ні kdialog, ні терміналу для вибору програвача')"
-  fi
+  need_interactive "$(_ 'немає ні діалогів (kdialog, zenity), ні терміналу для вибору програвача')" choose --tty
 
   load_config || true
   detect_players
@@ -458,8 +569,7 @@ cmd_choose() {
     for i in "${!ids[@]}"; do
       args+=("${ids[$i]}" "${labels[$i]}" "$([[ "${ids[$i]}" == "$current" ]] && echo on || echo off)")
     done
-    choice="$(kdialog --title "$APP_TITLE" --icon "$ICON" \
-      --radiolist "$(_ 'Що запускати, коли вставлено аудіо-CD?')" "${args[@]}")" || { log "$(_ 'Скасовано.')"; return 1; }
+    choice="$(ui_radiolist "$(_ 'Що запускати, коли вставлено аудіо-CD?')" "${args[@]}")" || { log "$(_ 'Скасовано.')"; return 1; }
   else
     _ 'Що запускати, коли вставлено аудіо-CD?'; echo
     for i in "${!ids[@]}"; do
@@ -480,7 +590,7 @@ cmd_choose() {
     local def="$PLAYER_CMD" custom=""
     [[ -n "$def" ]] || def='vlc cdda://{dev}'
     if use_gui; then
-      custom="$(kdialog --title "$APP_TITLE" --inputbox "$prompt" "$def")" || { log "$(_ 'Скасовано.')"; return 1; }
+      custom="$(ui_input "$prompt" "$def")" || { log "$(_ 'Скасовано.')"; return 1; }
     else
       echo "$prompt"
       read -rp "> " -e -i "$def" custom || return 1
@@ -512,9 +622,7 @@ cmd_choose() {
   [[ -f "$SOLID_FILE" ]] && cmd_solid >/dev/null
   local msg; msg="$(_ 'Обрано: %s' "$PLAYER_NAME")"
   [[ "$PLAYER_ID" == "off" ]] && msg="$(_ 'Автозапуск вимкнено (служба продовжує працювати, але нічого не запускатиме).')"
-  if use_gui; then
-    kdialog --title "$APP_TITLE" --passivepopup "$msg" 4 >/dev/null 2>&1 &
-  fi
+  use_gui && ui_passive "$msg"
   echo "$msg"
   [[ "$PLAYER_ID" != off ]] && { _ 'Перевірити команду: %s play -n' "$APP"; echo; }
   return 0
@@ -823,11 +931,8 @@ pick_device() {
 cmd_tag() {
   local dev=""
   for a in "$@"; do [[ "$a" == --* ]] || dev="$a"; done
-  # Без kdialog і без терміналу (запуск з меню) — відкриваємо Konsole
-  if ! use_gui && [[ ! -t 0 && "${CDAR_TTY:-0}" != 1 ]]; then
-    if have konsole && has_display; then exec konsole --hide-menubar -e "$SELF" tag --tty $dev; fi
-    die "$(_ 'немає ні kdialog, ні терміналу')"
-  fi
+  # shellcheck disable=SC2086  # порожній $dev не має ставати окремим аргументом
+  need_interactive "$(_ 'немає ні діалогів (kdialog, zenity), ні терміналу')" tag --tty $dev
   dev="$(pick_device "$dev")"
   load_config || true
   load_adapters
@@ -843,7 +948,7 @@ cmd_tag() {
 cmd_ask_tag() {
   local dev="${1:-}" act
   have notify-send && has_display || return 0
-  act="$(notify-send -a "$APP_TITLE" -i "$ICON" -A "tag=$(_ 'Ввести назви…')" \
+  act="$(notify-send -a "$APP_TITLE" -i "$ICON" -h "string:desktop-entry:$APP" -A "tag=$(_ 'Ввести назви…')" \
     "$(_ 'Назви треків невідомі')" \
     "$(_ 'Цього диска немає в MusicBrainz. Можна ввести назви треків вручну — або просто слухати далі.')" 2>/dev/null)"
   [[ "$act" == tag ]] && cmd_tag "$dev"
@@ -864,6 +969,93 @@ cmd_clean() {
   cmd_stop >/dev/null
   local c="${XDG_CACHE_HOME:-$HOME/.cache}/$APP"
   if [[ -d "$c" ]] && rm -rf -- "$c"; then _ 'Видалено скопійовані треки: %s' "$c"; else _ 'Кеш порожній.'; fi; echo
+}
+
+# Вставлений диск можуть запустити двоє: ця служба й автозапуск GNOME (cd-auto-runner launch
+# обрано в «Параметрах»). Диск отримує той, хто перший: другий програвач лише заважав би.
+claim_file() { printf '%s/%s/claim-%s' "${XDG_RUNTIME_DIR:-/tmp}" "$APP" "$(basename "$1")"; }
+claim_disc() {
+  local f now
+  f="$(claim_file "$1")"
+  mkdir -p "$(dirname "$f")"
+  now="$(date +%s)"
+  [[ -f "$f" ]] && ((now - $(stat -c %Y "$f" 2>/dev/null || echo 0) >= 15)) && rm -f -- "$f"
+  ( set -o noclobber; : > "$f" ) 2>/dev/null
+}
+
+# Вхід із .desktop-файлу: без адреси — вікно програми, з cdda://sr0/ — цей диск
+# (так GNOME відкриває диск обраною програмою й дією «Відкрити за допомогою»)
+cmd_launch() {
+  local uri="${1:-}" dev
+  [[ "$uri" == cdda://* ]] || { cmd_settings; return; }
+  dev="${uri#cdda://}"; dev="${dev#/}"; dev="${dev#dev/}"; dev="/dev/${dev%%/*}"
+  valid_device "$dev" || die "$(_ 'некоректний шлях до пристрою: %s' "$dev")"
+  claim_disc "$dev" || return 0
+  cmd_play "$dev"
+}
+
+# Вийняти диск. gvfs (GNOME, Cinnamon, Xfce) монтує аудіо-CD як cdda://srN/ і тримає привід
+# відкритим, а ядро не виймає диск, поки привід відкритий кимось іще. Тому спершу відмонтовуємо.
+cmd_eject() {
+  local dev="${1:-}" uri
+  [[ -n "$dev" ]] || dev="$(list_drives | head -n1)"
+  [[ -n "$dev" ]] || die "$(_ 'CD-привід не знайдено')"
+  valid_device "$dev" || die "$(_ 'некоректний шлях до пристрою: %s' "$dev")"
+  uri="cdda://$(basename "$dev")/"
+  if have gio && gio mount -l 2>/dev/null | grep -qF -- "-> $uri"; then
+    timeout 10 gio mount -u "$uri" 2>/dev/null || true
+  fi
+  have eject || die "$(_ 'немає програми eject (пакет util-linux)')"
+  eject "$dev"
+}
+
+# GNOME сам реагує на аудіо-CD: питає, що робити, або запускає обрану програму. Поруч зі
+# службою це другий запит або другий програвач, тому автозапуск диска можна передати службі.
+# Де стояв аудіо-CD у налаштуваннях GNOME, записуємо: «off» поверне все як було.
+GNOME_MEDIA=org.gnome.desktop.media-handling
+GNOME_CDDA=x-content/audio-cdda
+gnome_autorun_supported() { have gsettings && gsettings list-keys "$GNOME_MEDIA" >/dev/null 2>&1; }
+
+gnome_list() {  # gnome_list <ключ> → значення, по одному в рядку
+  gsettings get "$GNOME_MEDIA" "$1" 2>/dev/null | sed "s/^@as //; s/[][',]//g" | tr -s ' ' '\n' | sed '/^$/d'
+}
+gnome_list_set() {  # gnome_list_set <ключ> <значення…>
+  local k="$1" v out=""; shift
+  for v in "$@"; do out+="${out:+, }'$v'"; done
+  gsettings set "$GNOME_MEDIA" "$k" "[$out]"
+}
+gnome_list_has() { gnome_list "$1" | grep -qxF "$2"; }
+gnome_list_add() { gnome_list_has "$1" "$GNOME_CDDA" && return 0
+  local -a l; mapfile -t l < <(gnome_list "$1"); gnome_list_set "$1" "${l[@]}" "$GNOME_CDDA"; }
+gnome_list_del() { gnome_list_has "$1" "$GNOME_CDDA" || return 0
+  local -a l; mapfile -t l < <(gnome_list "$1" | grep -vxF "$GNOME_CDDA"); gnome_list_set "$1" "${l[@]}"; }
+
+gnome_autorun_on() { gnome_list_has autorun-x-content-ignore "$GNOME_CDDA" \
+  && ! gnome_list_has autorun-x-content-start-app "$GNOME_CDDA"; }
+
+cmd_gnome_autorun() {
+  local state="$CONFIG_DIR/gnome-autorun" k
+  gnome_autorun_supported || { _ 'Ці налаштування є лише в GNOME.'; echo; return 0; }
+  case "${1:-}" in
+    on)
+      if [[ ! -f "$state" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        for k in autorun-x-content-start-app autorun-x-content-ignore autorun-x-content-open-folder; do
+          gnome_list_has "$k" "$GNOME_CDDA" && echo "$k"
+        done > "$state"
+      fi
+      gnome_list_del autorun-x-content-start-app
+      gnome_list_del autorun-x-content-open-folder
+      gnome_list_add autorun-x-content-ignore
+      _ 'GNOME більше не реагує на аудіо-CD сам: диск запускає %s.' "$APP_TITLE"; echo ;;
+    off)
+      if [[ ! -f "$state" ]]; then _ 'Налаштування GNOME не змінювалися.'; echo; return 0; fi
+      gnome_list_del autorun-x-content-ignore
+      while read -r k; do [[ -n "$k" ]] && gnome_list_add "$k"; done < "$state"
+      rm -f -- "$state"
+      _ 'Налаштування GNOME для аудіо-CD відновлено.'; echo ;;
+    *) die "on | off" ;;
+  esac
 }
 
 cmd_watch() {
@@ -898,11 +1090,14 @@ cmd_watch() {
       if [[ "$action" == "remove" || "$media" != "1" ]]; then
         [[ -n "${loaded[$devname]:-}" ]] && log "$(_ 'Диск вийнято з %s' "$devname")"
         rm -f -- "${XDG_RUNTIME_DIR:-/tmp}/$APP/toc-$(basename "$devname")"   # кеш змісту диска
+        rm -f -- "$(claim_file "$devname")"
         unset "loaded[$devname]"
       elif [[ "$action" == "change" && "${audio:-0}" =~ ^[1-9] && -z "${loaded[$devname]:-}" ]]; then
         loaded[$devname]=1
         log "$(_ 'Виявлено аудіо-CD (треків: %s) у %s' "$audio" "$devname")"
-        cmd_play "$devname" || log "$(_ 'Не вдалося запустити програвач')"
+        if claim_disc "$devname"; then
+          cmd_play "$devname" || log "$(_ 'Не вдалося запустити програвач')"
+        fi
       fi
     fi
     action=""; devname=""; media=""; audio=""
@@ -930,6 +1125,10 @@ cmd_status() {
   else
     row "$(_ 'Служба')" "$(_ 'не встановлена (запустіть install.sh)')"
   fi
+  if desktop_is GNOME && gnome_autorun_supported; then
+    if gnome_autorun_on; then row GNOME "$(_ 'автозапуск диска передано цій програмі')"
+    else row GNOME "$(_ 'реагує на диск сам (%s gnome-autorun on)' "$APP")"; fi
+  fi
   local d
   for d in $(list_drives); do
     if disc_has_audio "$d"; then row "$(_ 'Привід')" "$d — $(_ 'аудіо-CD')"
@@ -940,12 +1139,12 @@ cmd_status() {
 }
 
 # ---------------------------------------------------------------------------
-# Головне вікно: меню керування (kdialog, а без нього — термінал)
+# Головне вікно: меню керування (діалоги, а без них — термінал)
 # ---------------------------------------------------------------------------
 menu_pick() {  # menu_pick <питання> ключ підпис … → ключ
   local q="$1"; shift
   if use_gui; then
-    kdialog --title "$APP_TITLE" --icon "$ICON" --geometry 600x560 --menu "$q" "$@"
+    ui_menu "$q" "$@"
     return
   fi
   local -a keys=() labels=()
@@ -969,7 +1168,7 @@ library_root() {
 
 show_text() {  # show_text <текст> [error]
   if use_gui; then
-    kdialog --title "$APP_TITLE" "$([[ "${2:-}" == error ]] && echo --sorry || echo --msgbox)" "$1" 2>/dev/null
+    ui_message "$1" "${2:-}"
   else
     printf '%s\n' "$1"
   fi
@@ -985,7 +1184,7 @@ run_action() {
 }
 
 cmd_settings() {
-  # Повноцінне вікно (PySide6), якщо можна; інакше — меню kdialog / термінал.
+  # Повноцінне вікно (PySide6), якщо можна; інакше — меню в діалогах або в терміналі.
   # --play [ПРИСТРІЙ] — одразу відтворювати диск у вбудованому програвачі
   local gui
   local -a gargs=()
@@ -997,12 +1196,10 @@ cmd_settings() {
     shift
   done
   if [[ "${CDAR_TTY:-0}" != 1 ]] && has_display && gui="$(gui_path)" && has_pyside; then
-    CDAR_UI_LANG="$CDAR_UI_LANG" CDAR_SELF="$SELF" exec python3 -I "$gui" "${gargs[@]}"
+    # shellcheck disable=SC2086  # порожній прапорець не має ставати окремим аргументом
+    CDAR_UI_LANG="$CDAR_UI_LANG" CDAR_SELF="$SELF" exec python3 $PYSIDE_FLAG "$gui" "${gargs[@]}"
   fi
-  if ! use_gui && [[ ! -t 0 && "${CDAR_TTY:-0}" != 1 ]]; then
-    if have konsole && has_display; then exec konsole --hide-menubar -e "$SELF" settings --tty; fi
-    die "$(_ 'немає ні kdialog, ні терміналу')"
-  fi
+  need_interactive "$(_ 'немає ні діалогів (kdialog, zenity), ні терміналу')" settings --tty
   local pick svc d
   while :; do
     load_config || true
@@ -1031,7 +1228,7 @@ cmd_settings() {
       online)  ONLINE="$([[ "$ONLINE" == yes ]] && echo no || echo yes)"; save_config ;;
       notify)  NOTIFY="$([[ "$NOTIFY" == yes ]] && echo no || echo yes)"; save_config ;;
       libdir)
-        if use_gui; then d="$(kdialog --title "$APP_TITLE" --getexistingdirectory "$(library_root)")" || continue
+        if use_gui; then d="$(ui_directory "$(library_root)")" || continue
         else read -rp "$(_ 'Тека бібліотеки (Enter — системна «Музика»): ')" d || continue; fi
         LIBRARY_DIR="$d"; save_config ;;
       service)
@@ -1056,7 +1253,7 @@ cmd_lang() {
   if [[ -z "$l" ]]; then
     local cur="$CDAR_UI_LANG"
     if use_gui; then
-      l="$(kdialog --title "$APP_TITLE" --radiolist "Мова / Language" \
+      l="$(ui_radiolist "Мова / Language" \
         en English "$([[ $cur == en ]] && echo on || echo off)" \
         uk Українська "$([[ $cur == uk ]] && echo on || echo off)")" || return 1
     else
@@ -1088,19 +1285,21 @@ usage() {
 Використання: %s <команда> [параметри]
 
   settings [--play]   вікно програми: вбудований програвач і все, що нижче
-  choose [--tty]      обрати програвач (kdialog або термінал)
+  choose [--tty]      обрати програвач (діалог або термінал)
   play [ПРИСТРІЙ]     запустити програвач для диска (за замовч. — перший аудіо-CD)
       -p, --player ID інша програма (id з «list»), напр. org.kde.elisa.desktop
       -n, --dry-run   лише показати команду
   open ФАЙЛ…          відкрити файли в обраному програвачі (-p і -n — як у play)
   rip [ПРИСТРІЙ]      скопіювати диск у бібліотеку музики (Виконавець/Альбом), без відтворення
   tag [ПРИСТРІЙ]      ввести назви треків (для дисків, яких немає в MusicBrainz)
+  eject [ПРИСТРІЙ]    вийняти диск (навіть якщо його тримає gvfs у GNOME)
   stop                зупинити копіювання треків
   clean               видалити скопійовані треки (~/.cache/%s)
   watch               стежити за приводами (це запускає служба systemd)
   status              показати налаштування і стан
   list                показати знайдені програвачі та їхні адаптери
-  solid               оновити пункти в меню «Диски і пристрої»
+  solid               оновити пункти в меню «Диски і пристрої» (KDE)
+  gnome-autorun on|off передати автозапуск аудіо-CD цій програмі або повернути його GNOME
   lang [uk|en]        мова інтерфейсу
   enable | disable    увімкнути/вимкнути службу
   -h, --help          ця довідка
@@ -1116,6 +1315,7 @@ main() {
   case "$cmd" in
     choose|--choose|-c) cmd_choose ;;
     settings|gui)       cmd_settings "$@" ;;
+    launch)             cmd_launch "$@" ;;
     set)                cmd_set "$@" ;;
     set-player)         cmd_set_player "$@" ;;
     perm)               cmd_perm "$@" ;;
@@ -1131,6 +1331,8 @@ main() {
     stop)               cmd_stop ;;
     rip)                cmd_play --rip "$@" ;;
     tag)                cmd_tag "$@" ;;
+    eject)              cmd_eject "$@" ;;
+    gnome-autorun)      cmd_gnome_autorun "$@" ;;
     ask-tag)            cmd_ask_tag "$@" ;;
     clean)              cmd_clean ;;
     enable|disable)     cmd_service "$cmd" ;;

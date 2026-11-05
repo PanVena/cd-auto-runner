@@ -50,7 +50,9 @@ cdar_log() { printf '[%s] %s\n' "$CDAR_NAME" "$*" >&2; }
 cdar_notify() {
   [[ "$CDAR_NOTIFY" == yes && "$CDAR_DRY_RUN" != 1 ]] || return 0
   command -v notify-send >/dev/null 2>&1 || return 0
-  local args=(-a "CD Auto Runner" -i media-optical-audio -p)
+  local icon=cd-auto-runner
+  [[ -f "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/$icon.svg" ]] || icon=media-optical-audio
+  local args=(-a "CD Auto Runner" -i "$icon" -h string:desktop-entry:cd-auto-runner -p)
   [[ -n "$CDAR_NOTIFY_ID" ]] && args+=(-r "$CDAR_NOTIFY_ID")
   local id
   id="$(notify-send "${args[@]}" "$1" "${2:-}" 2>/dev/null)" && [[ "$id" =~ ^[0-9]+$ ]] && CDAR_NOTIFY_ID="$id"

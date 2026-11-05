@@ -3,7 +3,7 @@
 
 Вікно показує стан і викликає cd-auto-runner (CDAR_SELF): уся логіка копіювання — у скрипті.
 Вбудований програвач відтворює скопійовані треки через mpv (окремий процес, керування —
-JSON IPC через локальний сокет) і показує себе системі через MPRIS (віджет «Програвач»,
+JSON IPC через локальний сокет) і показує себе системі через MPRIS (елементи керування музикою,
 мультимедійні клавіші); вікно згортається в системний лоток. Картка «Бібліотека» відкриває
 вже скопійовані диски замість вставленого (або коли диска немає), вкладка «Плейлісти» —
 плейлісти, що посилаються на треки бібліотеки. Тексти українською; EN — англійський
@@ -41,12 +41,16 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget,
+    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSplitter, QStackedWidget,
     QStyle, QStyledItemDelegate, QSystemTrayIcon, QTabBar, QTableWidget, QTableWidgetItem, QToolButton, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-try:    # MPRIS — необов'язково: без dbus-python програвач просто не видно у віджеті «Програвач»
+try:    # окремий модуль, а в деяких дистрибутивах і окремий пакет
+    from PySide6.QtDBus import QDBus, QDBusConnection, QDBusMessage, QDBusVariant
+except ImportError:
+    QDBusConnection = None
+try:    # MPRIS — необов'язково: без dbus-python програвача не видно в елементах керування музикою
     import dbus
     import dbus.service
     from dbus.mainloop.glib import DBusGMainLoop
@@ -54,6 +58,7 @@ except ImportError:
     dbus = None
 
 APP = "cd-auto-runner"
+GNOME = "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
 HOMEPAGE = "https://github.com/PanVena/cd-auto-runner"
 LANG = os.environ.get("CDAR_UI_LANG", "uk")
 
@@ -155,8 +160,12 @@ EN = {
     "Запускає обраний програвач, щойно вставлено аудіо-CD, має власний вбудований програвач і копіює диски в бібліотеку музики з назвами треків і обкладинками.":
         "Starts the player of your choice as soon as an audio CD is inserted, has its own built-in player and rips discs to your music library with track titles and cover art.",
     "Ліцензія: GNU GPL версії 2.": "License: GNU GPL version 2.",
-    "Відтворюю диск. Керувати ним можна зі значка в лотку або з віджета «Програвач».":
-        "Playing the disc. Control it from the tray icon or the Media Player widget.",
+    "Відтворюю диск. Керувати ним можна зі значка в лотку або з системних елементів керування музикою.":
+        "Playing the disc. Control it from the tray icon or your desktop's media controls.",
+    "Музика грає далі. Керувати нею можна з системних елементів керування музикою, а вікно відкриється з меню програм.":
+        "The music keeps playing. Control it from your desktop's media controls; the app menu brings the window back.",
+    "У GNOME для значка в лотку потрібне розширення AppIndicator (пакет gnome-shell-extension-appindicator).":
+        "In GNOME, the tray icon needs the AppIndicator extension (package gnome-shell-extension-appindicator).",
     "Бібліотека": "Library",
     "Диск у приводі": "Disc in the drive",
     "Тут з'являтимуться скопійовані диски.": "Ripped discs will appear here.",
@@ -297,14 +306,44 @@ def runtime_dir():
     return d
 
 
+# Значки Breeze, яких немає в Adwaita (тема GNOME): чим їх замінити
+ICON_ALIASES = {
+    "application-menu": "open-menu-symbolic",
+    "dialog-ok-apply": "object-select-symbolic",
+    "edit-clear-history": "edit-clear-all-symbolic",
+    "edit-rename": "document-edit-symbolic",
+    "emblem-ok-symbolic": "object-select-symbolic",
+    "internet-web-browser": "web-browser-symbolic",
+    "media-import-audio-cd": "document-save-symbolic",
+    "view-media-playlist": "view-list-symbolic",
+    "view-preview": "image-x-generic-symbolic",
+}
+
+
+def app_icon():
+    """Значок програми: зі встановленої теми, поруч зі скриптом (запуск із репозиторію) або значок CD."""
+    if QIcon.hasThemeIcon(APP):
+        return QIcon.fromTheme(APP)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, f"{APP}.svg"), os.path.join(here, "..", "desktop", f"{APP}.svg")):
+        if os.path.isfile(path):
+            return QIcon(path)
+    return QIcon.fromTheme("media-optical-audio")
+
+
+def theme_icon(*names):
+    """Перший значок із тих, що є в темі: сам, його символьний варіант або замінник."""
+    for name in names:
+        for candidate in (name, f"{name}-symbolic", ICON_ALIASES.get(name)):
+            if candidate and QIcon.hasThemeIcon(candidate):
+                return QIcon.fromTheme(candidate)
+    return app_icon() if "media-optical-audio" in names else QIcon()
+
+
 def icon(*names):
     """Монохромний значок теми, перефарбований кольором тексту кнопок: білий на темній
     темі, темний на світлій (без теми Plasma Qt бере значки, намальовані для іншого тла)."""
-    base = QIcon()
-    for name in names:
-        base = QIcon.fromTheme(name)
-        if not base.isNull():
-            break
+    base = theme_icon(*names)
     if base.isNull():
         return base
     pal = QApplication.palette()
@@ -360,6 +399,32 @@ def heart_icon():
                 p.end()
                 out.addPixmap(pix, mode, state)
     return out
+
+
+def portal_color_scheme():
+    """Вибір користувача зі стандартного порталу: 1 темна, 2 світла, 0 — немає вибору.
+    Працює незалежно від того, чи дійшла ця настройка до самого Qt."""
+    if QDBusConnection is None:
+        return 0
+    call = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                                         "org.freedesktop.portal.Settings", "ReadOne")
+    call.setArguments(["org.freedesktop.appearance", "color-scheme"])
+    reply = QDBusConnection.sessionBus().call(call, QDBus.Block, 300)
+    if reply.type() != QDBusMessage.ReplyMessage or not reply.arguments():
+        return 0
+    value = reply.arguments()[0]
+    value = value.variant() if isinstance(value, QDBusVariant) else value
+    return value if value in (1, 2) else 0
+
+
+def follow_color_scheme(app):
+    """Плазма сама передає Qt тему; поза нею беремо схему з порталу (потрібен Qt 6.8+)."""
+    if "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":"):
+        return 0
+    scheme = portal_color_scheme()
+    if scheme and hasattr(app.styleHints(), "setColorScheme"):
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark if scheme == 1 else Qt.ColorScheme.Light)
+    return scheme
 
 
 def is_dark(pal):
@@ -530,7 +595,7 @@ class Mpv(QObject):
             pass
 
 
-# --- MPRIS: вбудований програвач у віджеті «Програвач» і на мультимедійних клавішах -----
+# --- MPRIS: вбудований програвач в елементах керування музикою і на мультимедійних клавішах
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
 MPRIS_ROOT = "org.mpris.MediaPlayer2"
 MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
@@ -1408,7 +1473,7 @@ class AlbumEditor(QDialog):
     def show_cover(self, path):
         pix = QPixmap(path) if path else QPixmap()
         if pix.isNull():
-            self.preview.setPixmap(QIcon.fromTheme("media-optical-audio").pixmap(96, 96))
+            self.preview.setPixmap(app_icon().pixmap(96, 96))
         else:
             self.preview.setPixmap(rounded_pixmap(pix, self.COVER))
 
@@ -1549,19 +1614,39 @@ def card():
     return f
 
 
-def section(title):
-    """Картка налаштувань із жирним заголовком; повертає (картка, QFormLayout для рядків)."""
+def section(title, key):
+    """Згортана картка налаштувань: заголовок зі стрілкою, типово згорнута, стан запам'ятовується
+    за ключем (не за заголовком: той залежить від мови). Повертає (картка, QFormLayout для рядків)."""
     box = card()
     lay = QVBoxLayout(box)
     lay.setContentsMargins(16, 12, 16, 14)
     lay.setSpacing(8)
-    head = QLabel(title)
+    head = QToolButton()
     head.setObjectName("section")
+    head.setText(title)
+    head.setCheckable(True)
+    head.setAutoRaise(True)
+    head.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+    head.setIconSize(QSize(16, 16))
+    head.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
     lay.addWidget(head)
-    form = QFormLayout()
+    body = QWidget()
+    form = QFormLayout(body)
+    form.setContentsMargins(0, 0, 0, 0)
     form.setHorizontalSpacing(10)
     form.setVerticalSpacing(8)
-    lay.addLayout(form)
+    lay.addWidget(body)
+    box.body = body
+
+    def toggle(opened, save=True):
+        body.setVisible(opened)
+        head.setIcon(icon("pan-down-symbolic", "go-down") if opened else icon("pan-end-symbolic", "go-next"))
+        if save:
+            QSettings(APP, "gui").setValue(f"section/{key}", "true" if opened else "false")
+    head.clicked.connect(toggle)
+    opened = QSettings(APP, "gui").value(f"section/{key}", "false") == "true"
+    head.setChecked(opened)
+    toggle(opened, save=False)
     return box, form
 
 
@@ -1577,7 +1662,7 @@ class Combo(QComboBox):
 
 
 class MainWindow(QMainWindow):
-    COVER = 168
+    COVER = 132 if GNOME else 168     # шрифт GNOME більший за KDE: без цього інтерфейс завеликий
     request_info = Signal()     # виклик InfoWorker.load у фоновому потоці (queued)
     request_scan = Signal(str)              # LibraryWorker.scan
     request_times = Signal(str, list)       # LibraryWorker.durations
@@ -1585,8 +1670,10 @@ class MainWindow(QMainWindow):
     def __init__(self, play=False):
         super().__init__()
         self.setWindowTitle("CD Auto Runner")
-        self.setWindowIcon(QIcon.fromTheme("media-optical-audio"))
-        self.resize(1120, 860)
+        self.setWindowIcon(app_icon())
+        # не більше за екран: на ноутбуці 1536×864 логічних точок вікно 860 заввишки зайняло б його весь
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1120, int(screen.width() * 0.85)), min(860, int(screen.height() * 0.85)))
         self.info = {}              # те, що показано: диск, альбом бібліотеки або плейліст
         self.queue = {}             # те, що грає; перегляд інших альбомів його не чіпає
         self.disc = {}              # вставлений диск (показаний він чи ні)
@@ -1615,6 +1702,8 @@ class MainWindow(QMainWindow):
         self.mpris = None
         self.tray = None
         self.quitting = False       # «Вийти»: закриття вікна завершує програму, а не ховає її
+        self.backgrounded = False   # вікно закрито без лотка, а музика ще грає
+        self.scheme = 0             # схема кольорів із порталу, з якою побудовано вікно
         self.restart_lang = None    # мову змінено: main() перезапустить програму з новою мовою
         self.shut_down = False
         self.pending_play = play    # відтворити, щойно прочитано диск
@@ -1625,16 +1714,16 @@ class MainWindow(QMainWindow):
         hl = pal.color(QPalette.Highlight)
         self.setStyleSheet(f"""
             QFrame#card {{ background: palette(base); border: 1px solid palette(midlight); border-radius: 12px; }}
-            QLabel#title {{ font-size: 22pt; font-weight: 600; }}
-            QLabel#subtitle {{ font-size: 12pt; }}
+            QLabel#title {{ font-size: {17 if GNOME else 22}pt; font-weight: 600; }}
+            QLabel#subtitle {{ font-size: {11 if GNOME else 12}pt; }}
             QLabel#muted {{ color: {muted}; }}
             QLabel#badge {{ border-radius: 10px; padding: 2px 10px;
                            background: rgba({hl.red()},{hl.green()},{hl.blue()},40); color: {hl.name()}; }}
             QLabel#warn {{ border-radius: 10px; padding: 2px 10px;
                           background: rgba(246,116,0,45); color: #f67400; }}
-            QPushButton {{ padding: 7px 14px; }}
-            QPushButton#primary {{ font-weight: 600; padding: 8px 22px; }}
-            QLabel#section {{ font-weight: 600; }}
+            QPushButton {{ padding: {"5px 10px" if GNOME else "7px 14px"}; }}
+            QPushButton#primary {{ font-weight: 600; padding: {"6px 16px" if GNOME else "8px 22px"}; }}
+            QToolButton#section {{ font-weight: 600; border: none; background: transparent; }}
             QSplitter::handle {{ background: transparent; }}
         """)
 
@@ -1664,6 +1753,7 @@ class MainWindow(QMainWindow):
         self.load_settings()
         self.build_tray()
         self.restore_layout()
+        self.tree.setFocus()        # інакше фокус дістанеться бібліотеці й прокрутить до неї налаштування
         if self.mpv:
             self.mpris = start_mpris(self)
             self.update_player()
@@ -1754,11 +1844,11 @@ class MainWindow(QMainWindow):
         more.setToolTip(_("Ще"))
         more.setPopupMode(QToolButton.InstantPopup)
         menu = QMenu(more)
-        self.act_album = menu.addAction(QIcon.fromTheme("folder-music"), _("Відкрити теку альбому"),
+        self.act_album = menu.addAction(theme_icon("folder-music"), _("Відкрити теку альбому"),
                                         lambda: self.open_dir(self.info.get("LIBRARY_DIR", "")))
-        menu.addAction(QIcon.fromTheme("folder-music"), _("Відкрити бібліотеку музики"),
+        menu.addAction(theme_icon("folder-music"), _("Відкрити бібліотеку музики"),
                        lambda: self.open_dir(self.library_root()))
-        self.act_mb = menu.addAction(QIcon.fromTheme("internet-web-browser"), _("Додати диск у MusicBrainz"),
+        self.act_mb = menu.addAction(theme_icon("internet-web-browser"), _("Додати диск у MusicBrainz"),
                                      lambda: QDesktopServices.openUrl(QUrl(self.info.get("MB_URL", ""))))
         menu.addSeparator()
         self.act_eject = menu.addAction(icon("media-eject"), _("Вийняти диск"), self.eject)
@@ -2261,7 +2351,7 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
 
-        g1, f1 = section(_("Відтворення"))
+        g1, f1 = section(_("Відтворення"), "playback")
         self.player = Combo()
         self.player.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.player.setMinimumContentsLength(18)
@@ -2275,7 +2365,7 @@ class MainWindow(QMainWindow):
         f1.addRow(self.chk_notify)
         lay.addWidget(g1)
 
-        g2, f2 = section(_("Копіювання і бібліотека"))
+        g2, f2 = section(_("Копіювання і бібліотека"), "rip")
         self.fmt = Combo()
         for key, text in (("flac", "FLAC — без втрат"), ("opus", "Opus 160 кбіт/с — малий розмір"),
                           ("ogg", "Ogg Vorbis q6"), ("mp3", "MP3 VBR ~190 кбіт/с"),
@@ -2308,7 +2398,7 @@ class MainWindow(QMainWindow):
         f2.addRow(note)
         lay.addWidget(g2)
 
-        g3, f3 = section(_("Інтерфейс"))
+        g3, f3 = section(_("Інтерфейс"), "interface")
         self.lang = Combo()
         self.lang.addItem("English", "en")
         self.lang.addItem("Українська", "uk")
@@ -2318,6 +2408,8 @@ class MainWindow(QMainWindow):
         self.chk_tray = QCheckBox(_("Згортати в системний лоток під час закриття вікна"))
         self.chk_tray.setChecked(QSettings(APP, "gui").value("tray", "true") in (True, "true"))
         self.chk_tray.setEnabled(QSystemTrayIcon.isSystemTrayAvailable())
+        if not self.chk_tray.isEnabled() and GNOME:
+            self.chk_tray.setToolTip(_("У GNOME для значка в лотку потрібне розширення AppIndicator (пакет gnome-shell-extension-appindicator)."))
         self.chk_tray.clicked.connect(self.on_tray_option)
         f3.addRow(self.chk_tray)
         self.chk_quiet = QCheckBox(_("Вставлений диск відтворювати у лотку, не відкриваючи вікна"))
@@ -2328,7 +2420,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(g3)
         lay.addWidget(self.build_library(), 1)
         area.setWidget(inner)
+        # ширина за найдовшим рядком (прапорці не переносяться): шрифт GNOME ширший за KDE,
+        # і без цього праву колонку обрізала б горизонтальна смуга
         area.setMinimumWidth(360)
+        # лише після показу вікна: розмір залежить від стилю карток. Згорнуті картки теж
+        # враховуємо, інакше їх розгортання знову дало б горизонтальну смугу
+        def fit():
+            margins = lay.contentsMargins().left() + 32     # поля картки в section()
+            width = max([inner.minimumSizeHint().width()] + [g.body.minimumSizeHint().width() + margins for g in (g1, g2, g3)])
+            area.setMinimumWidth(max(360, width + area.verticalScrollBar().sizeHint().width() + 2 * area.frameWidth()))
+        QTimer.singleShot(0, fit)
         return area
 
     # --- бібліотека: відкрити скопійований диск --------------------------------------------
@@ -2472,7 +2573,7 @@ class MainWindow(QMainWindow):
             if image and not image.isNull():
                 item.setIcon(QIcon(rounded_pixmap(QPixmap.fromImage(image), THUMB, 24)))
             else:
-                item.setIcon(QIcon.fromTheme(fallback) if fallback else heart_icon())
+                item.setIcon(theme_icon(fallback) if fallback else heart_icon())
             item.setData(Qt.UserRole, key)
             hint = "\n".join(x for x in (title, sub if not key or not more else "", more) if x)
             item.setToolTip(f"{hint}\n{grid.hint}")
@@ -2824,7 +2925,7 @@ class MainWindow(QMainWindow):
             self.add_menu(menu, [(os.path.normpath(t["path"]), track_label(t)) for t in tracks])
             menu.addSeparator()
             menu.addAction(icon("document-edit"), _("Редагувати альбом…"), lambda: self.edit_album(key))
-            menu.addAction(QIcon.fromTheme("folder-music"), _("Відкрити теку альбому"), lambda: self.open_dir(key))
+            menu.addAction(theme_icon("folder-music"), _("Відкрити теку альбому"), lambda: self.open_dir(key))
         menu.exec(grid.viewport().mapToGlobal(pos))
 
     def show_tile(self, key):
@@ -2955,10 +3056,10 @@ class MainWindow(QMainWindow):
     def build_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
-        self.tray = QSystemTrayIcon(QIcon.fromTheme("media-optical-audio"), self)
+        self.tray = QSystemTrayIcon(app_icon(), self)
         self.tray.setToolTip("CD Auto Runner")
         menu = QMenu(self)
-        menu.addAction(QIcon.fromTheme("media-optical-audio"), _("Показати / сховати вікно"), self.toggle_window)
+        menu.addAction(app_icon(), _("Показати / сховати вікно"), self.toggle_window)
         menu.addSeparator()
         self.tray_play = [
             menu.addAction(icon("media-playback-start"), _("Відтворити / пауза"), self.toggle_play),
@@ -2983,8 +3084,8 @@ class MainWindow(QMainWindow):
         i = self.info
         title = " — ".join(x for x in (i.get("ALBUM_ARTIST", ""), i.get("ALBUM", "")) if x) or _("Аудіо-CD")
         cover = QPixmap(i["COVER"]) if i.get("COVER") else QPixmap()
-        tray_icon = QIcon(rounded_pixmap(cover, 128)) if not cover.isNull() else QIcon.fromTheme("media-optical-audio")
-        self.tray.showMessage(title, _("Відтворюю диск. Керувати ним можна зі значка в лотку або з віджета «Програвач»."),
+        tray_icon = QIcon(rounded_pixmap(cover, 128)) if not cover.isNull() else app_icon()
+        self.tray.showMessage(title, _("Відтворюю диск. Керувати ним можна зі значка в лотку або з системних елементів керування музикою."),
                               tray_icon, 8000)
 
     def update_tray_menu(self):
@@ -3108,14 +3209,14 @@ class MainWindow(QMainWindow):
             self.poll()
         proc.finished.connect(finished)
         proc.errorOccurred.connect(lambda err: err == QProcess.FailedToStart and finished(1, None))
-        proc.start("eject", [dev])
+        proc.start(self_bin(), ["eject", dev])     # спершу відпускає привід, якщо його тримає gvfs
 
     def about(self):
         if not self.isVisible():        # з меню лотка: вікно діалогу без батьківського не видно
             self.show_window()
         box = QMessageBox(self)
         box.setWindowTitle(_("Про програму"))
-        box.setIconPixmap(QIcon.fromTheme("media-optical-audio").pixmap(64, 64))
+        box.setIconPixmap(app_icon().pixmap(64, 64))
         box.setTextFormat(Qt.RichText)
         box.setText(f"<h3>CD Auto Runner</h3><p>{_('Версія {v}', v=self.version or '—')}</p>")
         box.setInformativeText(
@@ -3198,7 +3299,7 @@ class MainWindow(QMainWindow):
     def set_cover(self, path="", image=None):
         pix = QPixmap(path) if path else QPixmap.fromImage(image) if image else QPixmap()
         if pix.isNull():
-            pix = QIcon.fromTheme("media-optical-audio").pixmap(128, 128)
+            pix = app_icon().pixmap(128, 128)
             self.cover.setPixmap(pix)
         else:
             self.cover.setPixmap(rounded_pixmap(pix, self.COVER))
@@ -3345,7 +3446,26 @@ class MainWindow(QMainWindow):
                 pass
         return stamp
 
+    def can_background(self):
+        """Лотка немає зовсім (GNOME без розширення), але музикою можна керувати через MPRIS."""
+        return (self.mpris is not None and self.cur is not None and not self.is_paused
+                and not QSystemTrayIcon.isSystemTrayAvailable())
+
+    def follow_scheme(self):
+        """Тему змінили в системі: кольори вікна й значків задано під час побудови, тож вікно
+        будуємо заново, як і зі зміною мови. Музику й відкриті діалоги не перериваємо."""
+        if self.scheme and self.isVisible() and self.cur is None and not QApplication.activeModalWidget() \
+                and portal_color_scheme() not in (0, self.scheme):
+            self.restart_lang = LANG
+            self.quit_app()
+
     def poll(self):
+        self.follow_scheme()
+        # вікно закрито, поки грала музика, і вона скінчилася — програма більше не потрібна
+        if self.backgrounded and self.cur is None and not self.isVisible():
+            self.quitting = True
+            self.close()
+            return
         # назви змінили не з вікна (сповіщення «Ввести назви…», термінал) — оновити
         if self.disc and not self.loading and self.titles_mtime() != getattr(self, "titles_stamp", 0):
             self.reload_info()
@@ -3387,12 +3507,16 @@ class MainWindow(QMainWindow):
     def on_message(self, conn):
         show = False
         for line in bytes(conn.readAll()).decode(errors="replace").splitlines():
-            if line.strip() == "play":
+            words = line.split()
+            if words[:1] == ["play"]:
                 self.request_play()
                 show = show or not self.play_in_tray()
-            elif line.strip():
+            elif words:
                 show = True
+            if len(words) > 1:      # Wayland: фокус дає лише дозвіл, виданий запуску другого екземпляра
+                os.environ["XDG_ACTIVATION_TOKEN"] = words[1]
         if show:
+            self.backgrounded = False
             self.show_window()
 
     def closeEvent(self, event):
@@ -3405,7 +3529,18 @@ class MainWindow(QMainWindow):
             if settings.value("tray_hint", "false") != "true":
                 settings.setValue("tray_hint", "true")
                 self.tray.showMessage("CD Auto Runner", _("CD Auto Runner працює далі в системному лотку. Щоб вийти, оберіть «Вийти» в меню його значка."),
-                                      QIcon.fromTheme("media-optical-audio"), 6000)
+                                      app_icon(), 6000)
+            return
+        if not self.quitting and self.can_background():
+            event.ignore()
+            self.hide()
+            self.backgrounded = True
+            settings = QSettings(APP, "gui")
+            if settings.value("background_hint", "false") != "true" and read_config().get("NOTIFY", "yes") != "no":
+                settings.setValue("background_hint", "true")
+                QProcess.startDetached("notify-send", ["-a", "CD Auto Runner", "-i", APP,
+                                                       "-h", f"string:desktop-entry:{APP}", "CD Auto Runner",
+                                                       _("Музика грає далі. Керувати нею можна з системних елементів керування музикою, а вікно відкриється з меню програм.")])
             return
         super().closeEvent(event)
         QApplication.quit()
@@ -3435,6 +3570,11 @@ class MainWindow(QMainWindow):
 def main():
     play = "--play" in sys.argv[1:]
     app = QApplication(sys.argv[:1])
+    scheme = follow_color_scheme(app)
+    if GNOME and app.font().pointSizeF() >= 11:     # 11 pt GNOME щільний у GTK, а не у віджетах Qt
+        font = app.font()
+        font.setPointSizeF(font.pointSizeF() - 1)
+        app.setFont(font)
     # Без теми значків від Plasma — Breeze під колір вікна (темна тема — breeze-dark)
     paths = QIcon.themeSearchPaths()
     for d in [os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))] + \
@@ -3449,14 +3589,15 @@ def main():
     app.setApplicationName(APP)
     app.setApplicationDisplayName("CD Auto Runner")
     app.setDesktopFileName(APP)
-    app.setWindowIcon(QIcon.fromTheme("media-optical-audio"))
+    app.setWindowIcon(app_icon())
 
     # Вікно вже відкрите — передаємо йому команду й виходимо
     name = os.path.join(runtime_dir(), "gui.sock")
     sock = QLocalSocket()
     sock.connectToServer(name)
     if sock.waitForConnected(500):
-        sock.write(b"play\n" if play else b"show\n")
+        token = os.environ.get("XDG_ACTIVATION_TOKEN", "")
+        sock.write(f"{'play' if play else 'show'} {token}\n".encode())
         sock.flush()
         sock.waitForBytesWritten(1000)
         sock.disconnectFromServer()
@@ -3467,6 +3608,7 @@ def main():
 
     app.setQuitOnLastWindowClosed(False)   # вікно може ховатися в лоток; виходить closeEvent
     win = MainWindow(play=play)
+    win.scheme = scheme
     app.aboutToQuit.connect(win.shutdown)
     win.listen(server)
     if not (play and win.play_in_tray()):
@@ -3475,7 +3617,8 @@ def main():
     if win.restart_lang:
         # exec, а не дочірній процес: той лишився б у cgroup юніта systemd і помер би разом зі старим
         env = dict(os.environ, CDAR_UI_LANG=win.restart_lang)
-        os.execve(sys.executable, [sys.executable, "-I", os.path.abspath(__file__)], env)
+        flags = ["-I"] if sys.flags.isolated else ["-P"] if getattr(sys.flags, "safe_path", False) else []
+        os.execve(sys.executable, [sys.executable, *flags, os.path.abspath(__file__)], env)
     return code
 
 

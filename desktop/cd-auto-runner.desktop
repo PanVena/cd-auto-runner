@@ -5,8 +5,34 @@ Comment=Audio CD autoplay: player, music library, track titles
 Comment[uk]=Автозапуск аудіо-CD: програвач, бібліотека музики, назви треків
 GenericName=Audio CD autoplay
 GenericName[uk]=Автозапуск аудіо-CD
-Exec=@BIN@ settings
-Icon=media-optical-audio
+Exec=@BIN@ launch %U
+Icon=cd-auto-runner
 Terminal=false
-Categories=AudioVideo;Audio;Settings;
+StartupNotify=true
+StartupWMClass=cd-auto-runner
+Categories=AudioVideo;Audio;Player;
+MimeType=x-content/audio-cdda;
 Keywords=cd;audio;autoplay;autorun;player;диск;програвач;автозапуск;
+Actions=play;rip;tag;eject;
+
+[Desktop Action play]
+Name=Play disc
+Name[uk]=Відтворити диск
+Icon=media-playback-start
+Exec=@BIN@ play
+
+[Desktop Action rip]
+Name=Rip to music library
+Name[uk]=Скопіювати диск у бібліотеку музики
+Exec=@BIN@ rip
+
+[Desktop Action tag]
+Name=Enter track titles…
+Name[uk]=Ввести назви треків…
+Exec=@BIN@ tag
+
+[Desktop Action eject]
+Name=Eject disc
+Name[uk]=Вийняти диск
+Icon=media-eject
+Exec=@BIN@ eject

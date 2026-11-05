@@ -52,10 +52,27 @@ trap 'rm -f -- "$tmp"' EXIT
 title="$(_ 'Назви треків (на диску: %s)' "$CDAR_TRACKS")"
 gui=0; [[ "${CDAR_TTY:-0}" != 1 && -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]] && gui=1
 tagger="$(dirname "$CDAR_LIB")/_tagger.py"
-if ((gui)) && [[ -f "$tagger" ]] && python3 -c 'import PySide6.QtWidgets' 2>/dev/null; then
+# -I не бачить PySide6, встановлений через pip у теку користувача; тоді -P (див. has_pyside)
+pyflag=none
+if ((gui)) && [[ -f "$tagger" ]]; then
+  for f in -I -P ""; do
+    python3 $f -c 'import PySide6.QtWidgets' 2>/dev/null && { pyflag="$f"; break; }
+  done
+fi
+# У KDE простий редактор — kdialog, деінде спершу zenity
+dialogs="zenity kdialog"
+[[ ":${XDG_CURRENT_DESKTOP:-}:" == *:KDE:* ]] && dialogs="kdialog zenity"
+dialog=""
+for d in $dialogs; do command -v "$d" >/dev/null 2>&1 && { dialog="$d"; break; }; done
+if [[ "$pyflag" != none ]]; then
   # Форма з полями й таблицею треків (PySide6)
-  python3 -I "$tagger" "$tmp" "$title" "$(_cdar_musicbrainz_url)" || { cdar_log "$(_ 'Скасовано.')"; exit 0; }
-elif ((gui)) && command -v kdialog >/dev/null 2>&1; then
+  # shellcheck disable=SC2086  # порожній прапорець не має ставати окремим аргументом
+  python3 $pyflag "$tagger" "$tmp" "$title" "$(_cdar_musicbrainz_url)" || { cdar_log "$(_ 'Скасовано.')"; exit 0; }
+elif ((gui)) && [[ "$dialog" == zenity ]]; then
+  edited="$(zenity --text-info --editable --title="$title" --width=720 --height=640 --filename="$tmp" 2>/dev/null)" || {
+    cdar_log "$(_ 'Скасовано.')"; exit 0; }
+  printf '%s\n' "$edited" > "$tmp"
+elif ((gui)) && [[ "$dialog" == kdialog ]]; then
   edited="$(kdialog --title "CD Auto Runner" --textinputbox "$title" "$(cat "$tmp")" 720 640)" || {
     cdar_log "$(_ 'Скасовано.')"; exit 0; }
   printf '%s\n' "$edited" > "$tmp"

@@ -7,7 +7,24 @@
 set -euo pipefail
 
 APP="cd-auto-runner"
-SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO="https://github.com/PanVena/cd-auto-runner"
+SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-}")")" 2>/dev/null && pwd || true)"
+
+# Запуск без клонування (curl … | bash): тут є лише цей скрипт, тож завантажуємо весь проєкт.
+# Запитання мають читати клавіатуру, а не пайп, з якого прийшов скрипт.
+if [[ ! -f "$SRC/$APP" || ! -f "$SRC/i18n.sh" ]]; then
+  have_tty=0
+  [[ ! -t 0 ]] && { : < /dev/tty; } 2>/dev/null && have_tty=1
+  tmp="$(mktemp -d)"
+  trap 'rm -rf -- "$tmp"' EXIT
+  echo "==> $APP: downloading / завантаження…"
+  if ! curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$tmp" --strip-components=1; then
+    echo "Failed to download / не вдалося завантажити: $REPO" >&2
+    exit 1
+  fi
+  if ((have_tty)); then bash "$tmp/install.sh" "$@" < /dev/tty; else bash "$tmp/install.sh" "$@"; fi
+  exit $?
+fi
 
 BIN_DIR="$HOME/.local/bin"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -39,6 +56,7 @@ ok()   { printf '  %s✔%s %s\n' "$c_ok" "$c_0" "$*"; }
 warn() { printf '  %s!%s %s\n' "$c_warn" "$c_0" "$*"; }
 fail() { printf '%s%s%s %s\n' "$c_err" "$(_ 'Помилка:')" "$c_0" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+desktop_is() { [[ ":${XDG_CURRENT_DESKTOP:-}:" == *":$1:"* ]]; }
 
 ask() {  # ask "питання" [default y|n]
   local def="${2:-y}" ans hint
@@ -94,7 +112,7 @@ if ((UNINSTALL)); then
   exec bash "$SRC/uninstall.sh" "${args[@]}"
 fi
 
-for f in "$APP" i18n.sh gui/gui.py systemd/$APP.service desktop/$APP.desktop players/_lib.sh players/_generic.sh; do
+for f in "$APP" i18n.sh gui/gui.py systemd/$APP.service desktop/$APP.desktop desktop/$APP.svg players/_lib.sh players/_generic.sh; do
   [[ -f "$SRC/$f" ]] || fail "$(_ 'не знайдено файл %s — запускайте install.sh з теки проєкту.' "$SRC/$f")"
 done
 
@@ -120,10 +138,12 @@ step "$(_ 'Перевірка системи')"
 have udevadm || fail "$(_ 'немає udevadm (systemd-udev). Без нього відстежувати диски неможливо.')"
 ok "$(_ 'udevadm: є')"
 
-if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]]; then
+if desktop_is KDE; then
   ok "$(_ 'Середовище: KDE Plasma %s' "$(plasmashell --version 2>/dev/null | awk '{print $2}')")"
+elif desktop_is GNOME; then
+  ok "$(_ 'Середовище: GNOME %s' "$(gnome-shell --version 2>/dev/null | awk '{print $NF}')")"
 else
-  warn "$(_ 'Середовище: %s. Автозапуск працюватиме, але пункти в меню «Диски і пристрої» є лише в KDE.' "${XDG_CURRENT_DESKTOP:-?}")"
+  warn "$(_ 'Середовище: %s. Автозапуск працюватиме, але пунктів для дисків у системному меню не буде.' "${XDG_CURRENT_DESKTOP:-?}")"
 fi
 
 drives=$(ls /dev/sr* 2>/dev/null | tr '\n' ' ' || true)
@@ -171,15 +191,17 @@ fi
 
 # Необов'язкові, але бажані
 declare -A OPT_DESC=(
-  [kdialog]="$(_ 'графічне вікно вибору програвача')"
+  [kdialog]="$(_ 'діалоги без PySide6')"
+  [zenity]="$(_ 'діалоги без PySide6')"
   [notify-send]="$(_ 'сповіщення при вставлянні диска')"
   [cd-paranoia]="$(_ 'копіювання треків для Elisa, QMPlay2, Audacious і бібліотеки музики')"
   [ffmpeg]="$(_ 'кодування треків у FLAC/Opus/MP3 для бібліотеки музики')"
   [pyside6]="$(_ 'вікно програми, вбудований програвач і форма для введення назв треків')"
-  [dbus-python]="$(_ 'вбудований програвач у віджеті «Програвач» і на мультимедійних клавішах (MPRIS)')"
+  [dbus-python]="$(_ 'вбудований програвач у системних елементах керування музикою і на мультимедійних клавішах (MPRIS)')"
 )
 declare -A OPT_PKG=(  # dnf apt pacman zypper
   [kdialog]="kdialog kdialog kdialog kdialog"
+  [zenity]="zenity zenity zenity zenity"
   [notify-send]="libnotify libnotify-bin libnotify libnotify-tools"
   [cd-paranoia]="libcdio-paranoia cdparanoia cdparanoia cdparanoia"
   [ffmpeg]="ffmpeg-free ffmpeg ffmpeg ffmpeg"
@@ -194,7 +216,8 @@ has_tool() {
     *) have "$1" ;;
   esac
 }
-for tool in kdialog notify-send cd-paranoia ffmpeg pyside6 dbus-python; do
+if desktop_is KDE; then dialog_tool=kdialog; else dialog_tool=zenity; fi
+for tool in "$dialog_tool" notify-send cd-paranoia ffmpeg pyside6 dbus-python; do
   if has_tool "$tool"; then ok "$(_ '%s: є' "$tool")"; continue; fi
   warn "$(_ '%s не встановлено — %s' "$tool" "${OPT_DESC[$tool]}")"
   ((SKIP_DEPS)) && continue
@@ -205,6 +228,27 @@ for tool in kdialog notify-send cd-paranoia ffmpeg pyside6 dbus-python; do
     fi
   fi
 done
+
+# Лоток: у GNOME його немає без розширення. Програма працює й так, але вікно не ховається
+# в лоток: поки грає музика, керувати нею можна через MPRIS.
+tray_available() {
+  gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.NameHasOwner org.kde.StatusNotifierWatcher 2>/dev/null | grep -q true
+}
+if desktop_is GNOME && have gdbus && ! tray_available; then
+  warn "$(_ 'у GNOME немає системного лотка без розширення AppIndicator (значок програми, згортання в лоток).')"
+  if ((!SKIP_DEPS)) && ask "$(_ 'Встановити розширення AppIndicator (потрібен sudo)?')" n; then
+    if pkg_install gnome-shell-extension-appindicator gnome-shell-extension-appindicator \
+                   gnome-shell-extension-appindicator gnome-shell-extension-appindicator; then
+      for e in appindicatorsupport@rgcjonas.gmail.com ubuntu-appindicators@ubuntu.com; do
+        gnome-extensions enable "$e" 2>/dev/null && break
+      done
+      ok "$(_ 'розширення встановлено; воно запрацює після повторного входу в сеанс')"
+    else
+      warn "$(_ 'не вдалося встановити %s — продовжую без нього' "gnome-shell-extension-appindicator")"
+    fi
+  fi
+fi
 
 # Аудіо-CD програвачі
 found_rc=0
@@ -237,6 +281,7 @@ pkill -u "$USER" -f "$APP watch" 2>/dev/null || true
 install -Dm755 "$SRC/$APP" "$BIN";                          ok "$BIN"
 install -Dm644 "$SRC/i18n.sh" "$DATA_DIR/$APP/i18n.sh";     ok "$DATA_DIR/$APP/i18n.sh"
 install -Dm755 "$SRC/gui/gui.py" "$DATA_DIR/$APP/gui.py";   ok "$DATA_DIR/$APP/gui.py"
+install -Dm755 "$SRC/uninstall.sh" "$DATA_DIR/$APP/uninstall.sh"   # без клонування іншої копії немає
 PLAYERS_DIR="$DATA_DIR/$APP/players"
 rm -rf "$PLAYERS_DIR"; mkdir -p "$PLAYERS_DIR"
 install -m644 "$SRC/players/_lib.sh" "$PLAYERS_DIR/"
@@ -244,6 +289,9 @@ for f in "$SRC"/players/*.sh "$SRC"/players/*.py; do [[ "$(basename "$f")" == _l
 ok "$(_ '%s (адаптерів програвачів: %s)' "$PLAYERS_DIR" "$(ls "$SRC"/players/[!_]*.sh | wc -l)")"
 mkdir -p "$APPS_DIR"
 subst "$SRC/desktop/$APP.desktop" "$APPS_DIR/$APP.desktop"; ok "$(_ '%s (меню програм)' "$APPS_DIR/$APP.desktop")"
+ICON_DIR="$DATA_DIR/icons/hicolor"
+install -Dm644 "$SRC/desktop/$APP.svg" "$ICON_DIR/scalable/apps/$APP.svg"; ok "$ICON_DIR/scalable/apps/$APP.svg"
+touch "$ICON_DIR"   # нова дата теки: кеш значків застарів
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -261,16 +309,29 @@ if [[ "$CHOOSE" == auto ]]; then
   fi
 fi
 if [[ "$CHOOSE" == yes ]]; then
-  if [[ -t 0 ]] || have kdialog; then
+  if [[ -t 0 ]] || have kdialog || have zenity; then
     "$BIN" choose || warn "$(_ 'програвач не обрано — зробіть це пізніше: %s choose' "$APP")"
   else
-    warn "$(_ 'немає терміналу і kdialog — оберіть програвач пізніше: %s choose' "$APP")"
+    warn "$(_ 'немає ні терміналу, ні діалогів (kdialog, zenity) — оберіть програвач пізніше: %s choose' "$APP")"
   fi
 fi
 
 # --------------------------------------------------------------------------
-step "$(_ 'Меню «Диски і пристрої»')"
-"$BIN" solid | sed 's/^/  ✔ /'
+if desktop_is KDE || have plasmashell; then
+  step "$(_ 'Меню «Диски і пристрої»')"
+  "$BIN" solid | sed 's/^/  ✔ /'
+fi
+
+# GNOME сам питає, що робити з диском, або запускає свою програму: це другий запит
+# чи другий програвач на тому самому приводі
+if desktop_is GNOME && have gsettings && gsettings list-keys org.gnome.desktop.media-handling >/dev/null 2>&1; then
+  step "$(_ 'Автозапуск у GNOME')"
+  if ask "$(_ 'Передати автозапуск аудіо-CD цій програмі (GNOME не питатиме й не запускатиме свою програму)?')" y; then
+    "$BIN" gnome-autorun on | sed 's/^/  ✔ /'
+  else
+    ok "$(_ 'Залишено як є. Змінити: %s gnome-autorun on' "$APP")"
+  fi
+fi
 
 # --------------------------------------------------------------------------
 step "$(_ 'Автозапуск служби')"
@@ -324,12 +385,11 @@ step "$(_ 'Готово!')"
 echo
 _ '  Вставте аудіо-CD — обраний програвач запуститься автоматично.
 
-  Змінити програвач:   %s choose   (або «CD Auto Runner» у меню програм,
-                       або «Обрати програвач…» у меню «Диски і пристрої»)
+  Змінити програвач:   %s choose   (або «CD Auto Runner» у меню програм)
   Інший програвач раз: %s play --player <id>   (id — з «%s list»)
   Скопіювати диск:     %s rip
   Мова:                %s lang
   Стан:                %s status
   Журнал:              journalctl --user -u %s -f
-  Видалити:            ./uninstall.sh   (або ./install.sh --uninstall)
-' "$APP" "$APP" "$APP" "$APP" "$APP" "$APP" "$APP"
+  Видалити:            %s
+' "$APP" "$APP" "$APP" "$APP" "$APP" "$APP" "$APP" "$DATA_DIR/$APP/uninstall.sh"

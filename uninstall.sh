@@ -41,11 +41,15 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 pkill -u "$USER" -f "$APP watch" 2>/dev/null || true
 
+# Повертаємо GNOME реакцію на аудіо-CD, поки програма ще на місці
+[[ -x "$HOME/.local/bin/$APP" ]] && "$HOME/.local/bin/$APP" gnome-autorun off 2>/dev/null | sed 's/^/  /'
+
 for f in \
   "$HOME/.local/bin/$APP" \
   "$CONF_DIR/systemd/user/$APP.service" \
   "$DATA_DIR/solid/actions/$APP.desktop" \
   "$DATA_DIR/applications/$APP.desktop" \
+  "$DATA_DIR/icons/hicolor/scalable/apps/$APP.svg" \
   "$CONF_DIR/autostart/$APP.desktop"; do
   [[ -e "$f" ]] && rm -f "$f" && { _ '  видалено %s' "$f"; echo; }
 done
@@ -54,6 +58,7 @@ for d in "$DATA_DIR/$APP" "${XDG_CACHE_HOME:-$HOME/.cache}/$APP"; do
 done
 systemctl --user daemon-reload >/dev/null 2>&1 || true
 for k in kbuildsycoca6 kbuildsycoca5; do command -v $k >/dev/null && { $k >/dev/null 2>&1; break; }; done
+command -v update-desktop-database >/dev/null && update-desktop-database "$DATA_DIR/applications" >/dev/null 2>&1
 
 if [[ -d "$CONF_DIR/$APP" ]]; then
   if ((PURGE)); then
