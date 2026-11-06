@@ -16,8 +16,6 @@ Tested on Fedora 44 and 45 with GNOME 50 and KDE Plasma 6.7 and 6.8.
 - Albums sorted by artist, title, date added or year.
 - A blacklist: albums leave the library and songs are skipped.
 - All tracks of one artist in the library: open them or play only them from the album or track menu.
-- On start the app returns to the track, album and position where it stopped.
-- Clicking the now-playing line returns to the list the current song is playing from.
 - Disc actions in Disks & Devices (Plasma) and the app icon menu (GNOME).
 - Media keys and desktop media controls (MPRIS).
 - English and Ukrainian interface.
