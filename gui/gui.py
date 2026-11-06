@@ -32,14 +32,15 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QActionGroup,
     QColor, QDesktopServices, QFont, QIcon, QImage, QImageReader, QPainter, QPainterPath, QPalette, QPen, QPixmap,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
     QFrame, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider, QSplitter, QStackedWidget,
-    QStyle, QStyledItemDelegate, QSystemTrayIcon, QTabBar, QTableWidget, QTableWidgetItem, QToolButton, QTreeWidget,
+    QStyle, QStyledItemDelegate, QSystemTrayIcon, QTableWidget, QTableWidgetItem, QToolButton, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -49,6 +50,7 @@ except ImportError:
     QDBusConnection = None
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))     # запуск з -I: спільний модуль лежить поруч
 from cdar_core import (     # noqa: E402
+    ALBUM_SORTS, is_blocked_list,
     APP, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
     album_from_tags, album_tags, connect_mpris, embedded_cover, favorites_path, fetch_cover, fmt_time, is_playlist,
     looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc, read_marker, run,
@@ -58,6 +60,7 @@ from cdar_core import (     # noqa: E402
 # Значки Breeze, яких немає в Adwaita (тема GNOME): чим їх замінити
 ICON_ALIASES = {
     "application-menu": "open-menu-symbolic",
+    "dialog-cancel": "action-unavailable-symbolic",
     "dialog-ok-apply": "object-select-symbolic",
     "edit-clear-history": "edit-clear-all-symbolic",
     "edit-rename": "document-edit-symbolic",
@@ -427,7 +430,7 @@ class Task(QThread):
 
 class LibraryWorker(QObject):
     """Окремий потік: InfoWorker може чекати на диск і MusicBrainz до двох хвилин."""
-    scanned = Signal(object, object, object)    # альбоми, плейлісти, усі теки бібліотеки
+    scanned = Signal(object, object, object, object)    # альбоми, плейлісти, чорний список, усі теки
     timed = Signal(str, object)                 # тека альбому, {шлях: секунд}
 
     def __init__(self):
@@ -456,6 +459,74 @@ def rounded_pixmap(pix, size, radius=12):
     p.drawPixmap(0, 0, pix)
     p.end()
     return out
+
+
+class TabBadge(QLabel):
+    """Кружок із кількістю на вкладці; для довгих чисел витягується в капсулу."""
+    SIZE = 16
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedHeight(self.SIZE)
+        self.setMinimumWidth(self.SIZE)
+        self.setStyleSheet(f"background: palette(mid); color: palette(window-text); font-size: 7pt; "
+                           f"font-weight: bold; padding: 0 4px; border-radius: {self.SIZE // 2}px;")
+        self.hide()
+
+    def show_count(self, count):
+        self.setText("999+" if count > 999 else str(count))
+        self.adjustSize()
+        self.setVisible(count > 0)
+
+
+class TabButton(QToolButton):
+    """Вкладка: значок над підписом, кружок — на правому верхньому куті значка."""
+
+    def __init__(self, text, names):
+        super().__init__()
+        self.setObjectName("libtab")
+        self.setText(text)
+        self.setIcon(icon(*names))
+        self.setIconSize(QSize(20, 20))
+        self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.setCheckable(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.badge = TabBadge(self)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.badge.move(self.width() // 2 + 3, 2)
+
+
+class LibTabs(QWidget):
+    """Перемикач під сіткою альбомів, як AdwViewSwitcherBar у GNOME."""
+    currentChanged = Signal(int)
+
+    def __init__(self, tabs):
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.group = QButtonGroup(self)
+        for index, (text, names) in enumerate(tabs):
+            button = TabButton(text, names)
+            self.group.addButton(button, index)
+            lay.addWidget(button, 1)
+        self.group.button(0).setChecked(True)
+        self.group.idToggled.connect(lambda index, on: on and self.currentChanged.emit(index))
+
+    def currentIndex(self):
+        return self.group.checkedId()
+
+    def setCurrentIndex(self, index):
+        button = self.group.button(index)
+        if button:
+            button.setChecked(True)
+
+    def set_counts(self, counts):
+        for index, count in enumerate(counts):
+            self.group.button(index).badge.show_count(count)
 
 
 class AlbumTile(QStyledItemDelegate):
@@ -537,8 +608,13 @@ class AlbumGrid(QListWidget):
     def fit_tiles(self):
         # Місце під смугу прокрутки відкладаємо завжди: якби воно залежало від її видимості,
         # більші плитки вмикали б смугу, вона звужувала б плитки — і навпаки, без кінця
-        # (ще 2 px: якщо плитки вміщуються впритул, Qt переносить останню на новий рядок)
-        width = self.width() - self.verticalScrollBar().sizeHint().width() - 2
+        # (ще 2 px: якщо плитки вміщуються впритул, Qt переносить останню на новий рядок).
+        # Резерв той самий, що в QListView: смуга за метрикою стилю, а в Kvantum — ще й рамка довкола вмісту
+        style, bar = self.style(), self.verticalScrollBar()
+        extent = max(bar.sizeHint().width(), style.pixelMetric(QStyle.PM_ScrollBarExtent, None, bar))
+        if style.styleHint(QStyle.SH_ScrollView_FrameOnlyAroundContents, None, self):
+            extent += 2 * style.pixelMetric(QStyle.PM_DefaultFrameWidth, None, self)
+        width = self.maximumViewportSize().width() - extent - 2
         padding = 2 * AlbumTile.PAD + self.GAP
         cell = width // max(1, width // (AlbumTile.COVER + padding))
         cover = min(THUMB, max(AlbumTile.COVER, cell - padding))
@@ -854,39 +930,20 @@ def card():
     return f
 
 
-def section(title, key):
-    """Згортана картка налаштувань: заголовок зі стрілкою, типово згорнута, стан запам'ятовується
-    за ключем (не за заголовком: той залежить від мови). Повертає (картка, QFormLayout для рядків)."""
+def section(title):
+    """Картка налаштувань із заголовком. Повертає (картка, QFormLayout для рядків)."""
     box = card()
     lay = QVBoxLayout(box)
     lay.setContentsMargins(16, 12, 16, 14)
     lay.setSpacing(8)
-    head = QToolButton()
+    head = QLabel(title)
     head.setObjectName("section")
-    head.setText(title)
-    head.setCheckable(True)
-    head.setAutoRaise(True)
-    head.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-    head.setIconSize(QSize(16, 16))
-    head.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
     lay.addWidget(head)
-    body = QWidget()
-    form = QFormLayout(body)
+    form = QFormLayout()
     form.setContentsMargins(0, 0, 0, 0)
     form.setHorizontalSpacing(10)
     form.setVerticalSpacing(8)
-    lay.addWidget(body)
-    box.body = body
-
-    def toggle(opened, save=True):
-        body.setVisible(opened)
-        head.setIcon(icon("pan-down-symbolic", "go-down") if opened else icon("pan-end-symbolic", "go-next"))
-        if save:
-            QSettings(APP, "gui").setValue(f"section/{key}", "true" if opened else "false")
-    head.clicked.connect(toggle)
-    opened = QSettings(APP, "gui").value(f"section/{key}", "false") == "true"
-    head.setChecked(opened)
-    toggle(opened, save=False)
+    lay.addLayout(form)
     return box, form
 
 
@@ -902,7 +959,7 @@ class Combo(QComboBox):
 
 
 class MainWindow(Controller, QMainWindow):
-    COVER = 132 if GNOME else 168     # шрифт GNOME більший за KDE: без цього інтерфейс завеликий
+    COVER = 132
     request_info = Signal()     # виклик InfoWorker.load у фоновому потоці (queued)
     request_scan = Signal(str)              # LibraryWorker.scan
     request_times = Signal(str, list)       # LibraryWorker.durations
@@ -942,7 +999,10 @@ class MainWindow(Controller, QMainWindow):
                           background: rgba(246,116,0,45); color: #f67400; }}
             QPushButton {{ padding: {"5px 10px" if GNOME else "7px 14px"}; }}
             QPushButton#primary {{ font-weight: 600; padding: {"6px 16px" if GNOME else "8px 22px"}; }}
-            QToolButton#section {{ font-weight: 600; border: none; background: transparent; }}
+            QLabel#section {{ font-weight: 600; }}
+            QToolButton#libtab {{ border: none; border-radius: 8px; padding: 6px 4px 4px 4px; font-weight: 600; }}
+            QToolButton#libtab:hover {{ background: palette(alternate-base); }}
+            QToolButton#libtab:checked {{ background: palette(midlight); }}
             QSplitter::handle {{ background: transparent; }}
         """)
 
@@ -951,28 +1011,29 @@ class MainWindow(Controller, QMainWindow):
         outer = QVBoxLayout(root)
         outer.setContentsMargins(14, 14, 14, 8)
         outer.setSpacing(12)
-        outer.addWidget(self.build_header())
 
         self.split = split = QSplitter(Qt.Horizontal)
-        left = QWidget()
-        left_lay = QVBoxLayout(left)
-        left_lay.setContentsMargins(0, 0, 0, 0)
-        left_lay.setSpacing(12)
-        left_lay.addWidget(self.build_tracks(), 1)
-        left_lay.addWidget(self.build_player())
-        split.addWidget(left)
-        split.addWidget(self.build_settings())
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
-        split.setSizes([680, 420])
+        right = QWidget()
+        right_lay = QVBoxLayout(right)
+        right_lay.setContentsMargins(0, 0, 0, 0)
+        right_lay.setSpacing(12)
+        right_lay.addWidget(self.build_header())
+        right_lay.addWidget(self.build_tracks(), 1)
+        split.addWidget(self.build_library())
+        split.addWidget(right)
+        split.setStretchFactor(0, 2)
+        split.setStretchFactor(1, 3)
+        split.setSizes([420, 680])
         split.setChildrenCollapsible(False)
         outer.addWidget(split, 1)
+        outer.addWidget(self.build_player())
 
+        self.prefs = self.build_settings()
         self.build_statusbar()
         self.load_settings()
         self.build_tray()
         self.restore_layout()
-        self.tree.setFocus()        # інакше фокус дістанеться бібліотеці й прокрутить до неї налаштування
+        self.tree.setFocus()
         if self.mpv:
             self.mpris = start_mpris(self)
             self.update_player()
@@ -1094,14 +1155,12 @@ class MainWindow(Controller, QMainWindow):
         self.btn_rip = QPushButton(icon("media-import-audio-cd", "document-save"),
                                    _("Скопіювати в бібліотеку"))
         self.btn_tag = QPushButton(icon("document-edit"), _("Ввести назви"))
-        self.btn_stop = QPushButton(icon("media-playback-stop"), _("Зупинити"))
-        for b in (self.btn_play, self.btn_rip, self.btn_tag, self.btn_stop):
+        for b in (self.btn_play, self.btn_rip, self.btn_tag):
             b.setIconSize(QSize(20, 20))
             buttons.addWidget(b)
         self.btn_play.clicked.connect(self.on_play)
         self.btn_rip.clicked.connect(lambda: self.action("rip"))
         self.btn_tag.clicked.connect(self.on_tag)
-        self.btn_stop.clicked.connect(lambda: self.action("stop"))
 
         more = QToolButton()
         more.setIcon(icon("application-menu", "open-menu-symbolic"))
@@ -1112,18 +1171,11 @@ class MainWindow(Controller, QMainWindow):
         menu = QMenu(more)
         self.act_album = menu.addAction(theme_icon("folder-music"), _("Відкрити теку альбому"),
                                         lambda: self.open_dir(self.info.get("LIBRARY_DIR", "")))
-        menu.addAction(theme_icon("folder-music"), _("Відкрити бібліотеку музики"),
-                       lambda: self.open_dir(self.library_root()))
         self.act_mb = menu.addAction(theme_icon("internet-web-browser"), _("Додати диск у MusicBrainz"),
                                      lambda: QDesktopServices.openUrl(QUrl(self.info.get("MB_URL", ""))))
         menu.addSeparator()
         self.act_eject = menu.addAction(icon("media-eject"), _("Вийняти диск"), self.eject)
         menu.aboutToShow.connect(lambda: self.act_eject.setEnabled(self.last_tracks > 0))
-        menu.addAction(icon("view-refresh"), _("Оновити"), self.reload_info)
-        menu.addAction(icon("edit-clear-history"), _("Видалити тимчасові файли"),
-                       lambda: self.action("clean"))
-        menu.addSeparator()
-        menu.addAction(icon("help-about"), _("Про програму"), self.about)
         more.setMenu(menu)
         buttons.addStretch(1)
         buttons.addWidget(more)
@@ -1309,6 +1361,11 @@ class MainWindow(Controller, QMainWindow):
 
     # --- налаштування ----------------------------------------------------------------------
     def build_settings(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(_("Налаштування"))
+        dialog.setWindowModality(Qt.WindowModal)
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(0, 0, 0, 0)
         area = QScrollArea()
         area.setWidgetResizable(True)
         area.setFrameShape(QFrame.NoFrame)
@@ -1317,7 +1374,7 @@ class MainWindow(Controller, QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
 
-        g1, f1 = section(_("Відтворення"), "playback")
+        g1, f1 = section(_("Відтворення"))
         self.player = Combo()
         self.player.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.player.setMinimumContentsLength(18)
@@ -1331,7 +1388,7 @@ class MainWindow(Controller, QMainWindow):
         f1.addRow(self.chk_notify)
         lay.addWidget(g1)
 
-        g2, f2 = section(_("Копіювання і бібліотека"), "rip")
+        g2, f2 = section(_("Копіювання і бібліотека"))
         self.fmt = Combo()
         for key, text in (("flac", "FLAC — без втрат"), ("opus", "Opus 160 кбіт/с — малий розмір"),
                           ("ogg", "Ogg Vorbis q6"), ("mp3", "MP3 VBR ~190 кбіт/с"),
@@ -1364,7 +1421,7 @@ class MainWindow(Controller, QMainWindow):
         f2.addRow(note)
         lay.addWidget(g2)
 
-        g3, f3 = section(_("Інтерфейс"), "interface")
+        g3, f3 = section(_("Інтерфейс"))
         self.lang = Combo()
         self.lang.addItem("English", "en")
         self.lang.addItem("Українська", "uk")
@@ -1384,19 +1441,16 @@ class MainWindow(Controller, QMainWindow):
         self.chk_quiet.clicked.connect(lambda v: QSettings(APP, "gui").setValue("play_in_tray", "true" if v else "false"))
         f3.addRow(self.chk_quiet)
         lay.addWidget(g3)
-        lay.addWidget(self.build_library(), 1)
+        lay.addStretch(1)
+        lay.setContentsMargins(14, 14, 14, 14)
         area.setWidget(inner)
-        # ширина за найдовшим рядком (прапорці не переносяться): шрифт GNOME ширший за KDE,
-        # і без цього праву колонку обрізала б горизонтальна смуга
-        area.setMinimumWidth(360)
-        # лише після показу вікна: розмір залежить від стилю карток. Згорнуті картки теж
-        # враховуємо, інакше їх розгортання знову дало б горизонтальну смугу
-        def fit():
-            margins = lay.contentsMargins().left() + 32     # поля картки в section()
-            width = max([inner.minimumSizeHint().width()] + [g.body.minimumSizeHint().width() + margins for g in (g1, g2, g3)])
-            area.setMinimumWidth(max(360, width + area.verticalScrollBar().sizeHint().width() + 2 * area.frameWidth()))
-        QTimer.singleShot(0, fit)
-        return area
+        outer.addWidget(area)
+        # ширина за найдовшим рядком: прапорці не переносяться, а шрифт GNOME ширший за KDE
+        inner.ensurePolished()
+        width = inner.minimumSizeHint().width() + area.verticalScrollBar().sizeHint().width()
+        screen = QApplication.primaryScreen().availableGeometry()
+        dialog.resize(min(max(560, width), screen.width()), min(720, int(screen.height() * 0.85)))
+        return dialog
 
     # --- бібліотека: відкрити скопійований диск --------------------------------------------
     def album_grid(self, empty_text, hint):
@@ -1433,36 +1487,81 @@ class MainWindow(Controller, QMainWindow):
         lay.setContentsMargins(16, 8, 16, 14)
         lay.setSpacing(8)
         head = QHBoxLayout()
-        self.lib_tabs = QTabBar()
-        self.lib_tabs.addTab(_("Бібліотека"))
-        self.lib_tabs.addTab(_("Плейлісти"))
-        self.lib_tabs.setDrawBase(False)
-        self.lib_tabs.setExpanding(False)
         self.lib_add = QToolButton()
         self.lib_add.setAutoRaise(True)
         self.lib_add.clicked.connect(self.on_lib_add)
-        head.addWidget(self.lib_tabs)
-        head.addStretch(1)
+        self.lib_sort = QToolButton()
+        self.lib_sort.setAutoRaise(True)
+        self.lib_sort.setIcon(icon("view-sort-ascending"))
+        self.lib_sort.setToolTip(_("Сортування"))
+        self.lib_sort.setPopupMode(QToolButton.InstantPopup)
+        self.lib_sort.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        menu, group = QMenu(self.lib_sort), QActionGroup(self.lib_sort)
+        for mode, text in ALBUM_SORTS.items():
+            act = group.addAction(_(text))
+            act.setCheckable(True)
+            act.setChecked(mode == self.sort)
+            act.triggered.connect(lambda _on=False, m=mode: self.set_sort(m))
+            menu.addAction(act)
+        self.lib_sort.setMenu(menu)
         head.addWidget(self.lib_add)
+        head.addWidget(self.lib_sort)
+        head.addStretch(1)
+        head.addWidget(self.build_main_menu())
         lay.addLayout(head)
         page, self.lib_list = self.album_grid(_("Тут з'являтимуться скопійовані диски."),
                                               _("Двічі клацніть альбом, щоб відтворити його."))
         lists, self.list_grid = self.album_grid(
             _("Плейлістів ще немає: створіть перший кнопкою «+» або додайте до нього треки через контекстне меню."),
             _("Двічі клацніть плейліст, щоб відтворити його."))
+        blocked, self.block_grid = self.album_grid(
+            _("Тут будуть альбоми й пісні з чорного списку: альбоми зникають із бібліотеки, а пісні пропускаються."),
+            _("Двічі клацніть альбом, щоб відтворити його."))
         self.lib_pages = QStackedWidget()
         self.lib_pages.addWidget(page)
         self.lib_pages.addWidget(lists)
+        self.lib_pages.addWidget(blocked)
         lay.addWidget(self.lib_pages, 1)
+        self.lib_tabs = LibTabs(((_("Бібліотека"), ("folder-music-symbolic", "folder-music")),
+                                 (_("Плейлісти"), ("view-list-symbolic", "view-media-playlist")),
+                                 (_("Чорний список"), ("action-unavailable-symbolic", "dialog-cancel"))))
+        lay.addWidget(self.lib_tabs)
         self.lib_tabs.currentChanged.connect(self.on_lib_tab)
         tab = QSettings(APP, "gui").value("library_tab", 0)
         self.lib_tabs.setCurrentIndex(int(tab) if str(tab).isdigit() else 0)
         self.on_lib_tab(self.lib_tabs.currentIndex())
+        box.setMinimumWidth(360)        # дві колонки плиток
         return box
+
+    def build_main_menu(self):
+        button = QToolButton()
+        button.setAutoRaise(True)
+        button.setIcon(icon("open-menu-symbolic", "application-menu"))
+        if button.icon().isNull():
+            button.setText("⋯")
+        button.setToolTip(_("Головне меню"))
+        button.setPopupMode(QToolButton.InstantPopup)
+        button.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        menu = QMenu(button)
+        menu.addAction(icon("view-refresh"), _("Оновити"), self.reload_info)
+        self.act_stop = menu.addAction(icon("media-playback-stop"), _("Зупинити копіювання"), lambda: self.action("stop"))
+        menu.addAction(icon("edit-clear-history"), _("Видалити тимчасові файли"), lambda: self.action("clean"))
+        menu.addSeparator()
+        menu.addAction(icon("configure", "preferences-system"), _("Налаштування"), self.show_preferences)
+        menu.addAction(icon("help-about"), _("Про програму"), self.about)
+        menu.addAction(icon("application-exit"), _("Вийти"), self.quit_app)
+        button.setMenu(menu)
+        return button
+
+    def show_preferences(self):
+        self.prefs.show()
+        self.prefs.raise_()
 
     def on_lib_tab(self, index):
         self.lib_pages.setCurrentIndex(index)
         QSettings(APP, "gui").setValue("library_tab", index)
+        self.lib_sort.setVisible(index == 0)
+        self.lib_add.setVisible(index < 2)
         if index:
             self.lib_add.setIcon(icon("list-add"))
             self.lib_add.setToolTip(_("Новий плейліст"))
@@ -1471,7 +1570,7 @@ class MainWindow(Controller, QMainWindow):
             self.lib_add.setToolTip(_("Покладіть теку з музикою в бібліотеку — альбом з'явиться тут"))
 
     def on_lib_add(self):
-        if self.lib_tabs.currentIndex():
+        if self.lib_tabs.currentIndex() == 1:
             self.new_playlist()
         else:
             self.open_dir(self.library_root())
@@ -1479,9 +1578,8 @@ class MainWindow(Controller, QMainWindow):
     def rescan(self):
         self.request_scan.emit(self.library_root())
 
-    def on_scanned(self, albums, playlists, folders):
-        self.albums, self.playlists = albums, playlists
-        self.load_favorites()
+    def on_scanned(self, albums, playlists, blocked, folders):
+        self.take_scan(albums, playlists, blocked)
         known, now = set(self.watcher.directories()), set(folders)
         if known - now:
             self.watcher.removePaths(list(known - now))
@@ -1494,9 +1592,11 @@ class MainWindow(Controller, QMainWindow):
 
     def fill_library(self):
         """Плитки: вставлений диск (якщо є) і скопійовані альбоми; відкрите зараз — жирним."""
-        albums, playlists, current = self.library_rows()
+        albums, playlists, blocked, current = self.library_rows()
         self.fill_grid(self.lib_list, *albums, current)
         self.fill_grid(self.list_grid, *playlists, current)
+        self.fill_grid(self.block_grid, *blocked, current)
+        self.lib_tabs.set_counts((len(albums[0]), len(playlists[0]), self.blocked_count()))
 
     def fill_grid(self, grid, rows, thumbs, current):
         if (rows, current) == grid.shown:
@@ -1616,7 +1716,9 @@ class MainWindow(Controller, QMainWindow):
         if not links:
             menu.setToolTipsVisible(True)
             menu.actions()[1].setToolTip(_("Спершу дочекайтеся, поки трек скопіюється в бібліотеку."))
-        if self.playlist_open():
+        block = menu.addAction(icon("dialog-cancel"), self.block_label(links), lambda: self.block_chosen(links))
+        block.setEnabled(self.can_block(links))
+        if self.playlist_open() and not self.is_blocked_open():
             menu.addSeparator()
             up = menu.addAction(icon("go-up"), _("Вище"), lambda: self.move_tracks(-1))
             down = menu.addAction(icon("go-down"), _("Нижче"), lambda: self.move_tracks(1))
@@ -1631,6 +1733,10 @@ class MainWindow(Controller, QMainWindow):
         if not key:
             return
         menu = QMenu(self)
+        if is_blocked_list(key):
+            menu.addAction(icon("document-open"), _("Відкрити"), lambda: self.show_tile(key))
+            menu.exec(grid.viewport().mapToGlobal(pos))
+            return
         menu.addAction(icon("media-playback-start"), _("Відтворити"), lambda: self.play_tile(key))
         menu.addAction(icon("document-open"), _("Відкрити"), lambda: self.show_tile(key))
         if is_playlist(key):
@@ -1649,6 +1755,8 @@ class MainWindow(Controller, QMainWindow):
             menu.addSeparator()
             menu.addAction(icon("document-edit"), _("Редагувати альбом…"), lambda: self.edit_album(key))
             menu.addAction(theme_icon("folder-music"), _("Відкрити теку альбому"), lambda: self.open_dir(key))
+            menu.addSeparator()
+            menu.addAction(icon("dialog-cancel"), self.album_block_label(key), lambda: self.toggle_album_block(key))
         menu.exec(grid.viewport().mapToGlobal(pos))
 
     def edit_album(self, folder):
@@ -1935,7 +2043,7 @@ class MainWindow(Controller, QMainWindow):
 
     def restore_layout(self):
         settings = QSettings(APP, "gui")
-        geometry, state = settings.value("geometry"), settings.value("splitter")
+        geometry, state = settings.value("geometry"), settings.value("sidebar_split")
         if geometry:
             self.restoreGeometry(geometry)
         if state:
@@ -1945,7 +2053,7 @@ class MainWindow(Controller, QMainWindow):
     def save_layout(self):
         settings = QSettings(APP, "gui")
         settings.setValue("geometry", self.saveGeometry())
-        settings.setValue("splitter", self.split.saveState())
+        settings.setValue("sidebar_split", self.split.saveState())
 
     def open_dir(self, path):
         if path:
@@ -1955,7 +2063,7 @@ class MainWindow(Controller, QMainWindow):
     # --- диск ---------------------------------------------------------------------------
     def set_buttons(self, enabled):
         disc = enabled and not self.album_open()    # копіювати й називати можна лише диск
-        for b in (self.btn_play, self.btn_stop):
+        for b in (self.btn_play, self.act_stop):
             b.setEnabled(enabled)
         for b in (self.btn_rip, self.act_mb):
             b.setEnabled(disc)
@@ -1979,7 +2087,7 @@ class MainWindow(Controller, QMainWindow):
         self.badge.hide()
         self.tree.clear()
         self.set_buttons(False)
-        self.btn_stop.setEnabled(True)
+        self.act_stop.setEnabled(True)
         self.update_player()
         self.fill_library()
 
@@ -2026,9 +2134,13 @@ class MainWindow(Controller, QMainWindow):
         for t in self.info.get("tracks", []):
             item = QTreeWidgetItem([f"{t.get('num', t['n']):02d}", t["artist"], t["title"],
                                     fmt_time(t["sec"]) if t["sec"] else "", ""])
+            blocked = self.track_blocked(t, self.info)
             if t.get("missing"):
                 item.setText(4, _("файлу немає"))
                 item.setIcon(4, icon("dialog-warning"))
+            elif blocked:
+                item.setText(4, _("у чорному списку"))
+                item.setIcon(4, icon("dialog-cancel"))
             elif t.get("path"):
                 item.setText(4, _("у бібліотеці"))
                 item.setIcon(4, icon("emblem-ok-symbolic"))
@@ -2037,7 +2149,7 @@ class MainWindow(Controller, QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemIsDropEnabled)
             item.setTextAlignment(0, Qt.AlignRight | Qt.AlignVCenter)
             item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
-            if t["placeholder"]:
+            if t["placeholder"] or blocked:
                 for c in (1, 2):
                     item.setForeground(c, muted)
                     item.setFont(c, italic)

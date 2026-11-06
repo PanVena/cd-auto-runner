@@ -589,7 +589,7 @@ _cdar_track_stem() {
 _cdar_relink_playlists() {  # _cdar_relink_playlists <старий файл> <новий файл>
   local root list tmp
   root="$(_cdar_library_root)"
-  for list in "$root/Playlists/"*.m3u8; do
+  for list in "$root/Playlists/"*.m3u8 "$root/Playlists/".*.m3u8; do    # з крапки — чорний список
     [[ -f "$list" ]] && grep -qxF -- "../${1#"$root/"}" "$list" || continue
     tmp="$list.part"
     OLD="../${1#"$root/"}" NEW="../${2#"$root/"}" \
@@ -631,6 +631,7 @@ _cdar_retag_library() {
   [[ "$old" -ef "$new" ]] || rm -f -- "$old/$CDAR_MARKER"
   _cdar_write_marker "$new"
   if [[ ! "$old" -ef "$new" ]]; then
+    _cdar_relink_playlists "$old" "$new"      # чорний список альбомів зберігає теки
     rmdir -- "$old" 2>/dev/null && rmdir -- "$(dirname "$old")" 2>/dev/null
   fi
   return 0

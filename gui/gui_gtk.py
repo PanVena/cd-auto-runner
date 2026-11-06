@@ -39,6 +39,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gsk
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))     # запуск з -I: спільний модуль лежить поруч
 from cdar_core import (     # noqa: E402
+    ALBUM_SORTS, is_blocked_list,
     APP, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
     album_from_tags, album_tags, connect_mpris, embedded_cover, favorites_path, fetch_cover, fmt_time, is_playlist,
     looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc, read_marker, run,
@@ -61,6 +62,7 @@ ICONS = {
     "media-record": "media-record-symbolic",
     "media-playlist-repeat": "media-playlist-repeat-symbolic",
     "media-playlist-repeat-song": "media-playlist-repeat-song-symbolic",
+    "dialog-cancel": "action-unavailable-symbolic",
 }
 HEART = f"{APP}-heart-symbolic"
 HEART_ON = f"{APP}-heart-filled-symbolic"
@@ -1265,7 +1267,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             "play": lambda: self.on_play(), "rip": lambda: self.action("rip"), "tag": self.on_tag,
             "stop-rip": lambda: self.action("stop"), "eject": self.eject, "refresh": self.reload_info,
             "clean": lambda: self.action("clean"), "open-album": lambda: self.open_dir(self.info.get("LIBRARY_DIR", "")),
-            "open-library": lambda: self.open_dir(self.library_root()), "add-disc": self.add_to_musicbrainz,
+            "add-disc": self.add_to_musicbrainz,
             "preferences": self.show_preferences, "about": self.about, "quit": self.quit_app,
             "play-pause": self.toggle_play, "next": self.next_track, "previous": self.prev_track,
             "stop-playback": self.stop_playback, "new-playlist": lambda: self.new_playlist(),
@@ -1273,7 +1275,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             "tracks-new-playlist": lambda: self.new_playlist(self.menu_links),
             "tracks-favorite": lambda: self.toggle_favorite(self.menu_links),
             "tracks-up": lambda: self.move_tracks(-1), "tracks-down": lambda: self.move_tracks(1),
-            "tracks-remove": self.remove_tracks,
+            "tracks-remove": self.remove_tracks, "tracks-block": lambda: self.block_chosen(self.menu_links),
         }
         for name, handler in plain.items():
             act = Gio.SimpleAction.new(name, None)
@@ -1284,11 +1286,19 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             "tile-cover": self.set_playlist_cover, "tile-cover-clear": self.remove_playlist_cover,
             "tile-delete": self.delete_playlist, "tile-edit": self.edit_album, "tile-folder": self.open_dir,
             "add-to": lambda path: self.add_to_playlist(path, self.menu_links),
+            "tile-block": self.toggle_album_block,
         }
         for name, handler in keyed.items():
             act = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
             act.connect("activate", lambda _a, p, h=handler: h(p.get_string()))
             self.add_action(act)
+        sort = Gio.SimpleAction.new_stateful("sort", GLib.VariantType.new("s"), GLib.Variant("s", self.sort))
+        sort.connect("activate", self.on_sort)
+        self.add_action(sort)
+
+    def on_sort(self, action, value):
+        action.set_state(value)
+        self.set_sort(value.get_string())
 
     def enable(self, name, on):
         self.lookup_action(name).set_enabled(on)
@@ -1321,7 +1331,6 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         disc.append(_("Оновити"), "win.refresh")
         disc.append(_("Зупинити копіювання"), "win.stop-rip")
         disc.append(_("Видалити тимчасові файли"), "win.clean")
-        disc.append(_("Відкрити бібліотеку музики"), "win.open-library")
         menu.append_section(None, disc)
         app = Gio.Menu()
         app.append(_("Налаштування"), "win.preferences")
@@ -1337,18 +1346,27 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.list_grid = Grid(self, _("Плейлістів ще немає: створіть перший кнопкою «+» або додайте до нього треки через контекстне меню."),
                               _("Двічі клацніть плейліст, щоб відтворити його."))
         self.lib_stack.add_titled_with_icon(self.lib_list, "library", _("Бібліотека"), "folder-music-symbolic")
+        self.block_grid = Grid(self, _("Тут будуть альбоми й пісні з чорного списку: альбоми зникають із бібліотеки, а пісні пропускаються."),
+                               _("Двічі клацніть альбом, щоб відтворити його."))
         self.lib_stack.add_titled_with_icon(self.list_grid, "playlists", _("Плейлісти"), "view-list-symbolic")
+        self.lib_stack.add_titled_with_icon(self.block_grid, "blacklist", _("Чорний список"), "action-unavailable-symbolic")
         self.lib_stack.set_visible_child_name(self.state.get("library_tab", "library"))
         self.lib_stack.connect("notify::visible-child-name", self.on_lib_tab)
 
-        head = Adw.HeaderBar(title_widget=Adw.ViewSwitcher(stack=self.lib_stack, policy=Adw.ViewSwitcherPolicy.WIDE))
+        head = Adw.HeaderBar()              # три вкладки в заголовку бічної панелі вже не вміщуються
         self.lib_add = icon_button("list-add-symbolic", "", self.on_lib_add)
+        sorts = Gio.Menu()
+        for mode, text in ALBUM_SORTS.items():
+            sorts.append_item(menu_item(_(text), "win.sort", mode))
+        self.lib_sort = Gtk.MenuButton(icon_name="view-sort-ascending-symbolic", menu_model=sorts, tooltip_text=_("Сортування"))
         head.pack_start(self.lib_add)
+        head.pack_start(self.lib_sort)
         head.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=self.main_menu(),
                                      tooltip_text=_("Головне меню"), primary=True))
         self.tile_menu = make_popover(self.lib_stack)
         view = Adw.ToolbarView(content=self.lib_stack)
         view.add_top_bar(head)
+        view.add_bottom_bar(Adw.ViewSwitcherBar(stack=self.lib_stack, reveal=True))
         self.on_lib_tab()
         return Adw.NavigationPage(title="CD Auto Runner", tag="library", child=view)
 
@@ -1356,6 +1374,8 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         tab = self.lib_stack.get_visible_child_name()
         self.state.put("library_tab", tab)
         playlists = tab == "playlists"
+        self.lib_sort.set_visible(tab == "library")
+        self.lib_add.set_visible(tab != "blacklist")
         self.lib_add.set_icon_name("list-add-symbolic" if playlists else "folder-open-symbolic")
         self.lib_add.set_tooltip_text(_("Новий плейліст") if playlists else
                                       _("Покладіть теку з музикою в бібліотеку — альбом з'явиться тут"))
@@ -1587,8 +1607,8 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.lib_jobs.put(self.on_scanned, self.thumbs.scan, self.library_root())
 
     def on_scanned(self, result):
-        self.albums, self.playlists, folders = result
-        self.load_favorites()
+        albums, playlists, blocked, folders = result
+        self.take_scan(albums, playlists, blocked)
         known, now = set(self.monitors), set(folders)
         for folder in known - now:
             self.monitors.pop(folder).cancel()
@@ -1615,9 +1635,13 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def fill_library(self):
-        albums, playlists, current = self.library_rows()
+        albums, playlists, blocked, current = self.library_rows()
         self.lib_list.fill(*albums, current, False)
         self.list_grid.fill(*playlists, current, True)
+        self.block_grid.fill(*blocked, current, False)
+        counts = (self.lib_list, len(albums[0])), (self.list_grid, len(playlists[0])), (self.block_grid, self.blocked_count())
+        for grid, count in counts:
+            self.lib_stack.get_page(grid).set_badge_number(count)
 
     def open_tile(self, key):
         """Показує плитку; у вузькому вікні — переходить до списку треків."""
@@ -1635,10 +1659,13 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             return
         menu = Gio.Menu()
         first = Gio.Menu()
-        first.append_item(menu_item(_("Відтворити"), "win.tile-play", key))
+        if not is_blocked_list(key):
+            first.append_item(menu_item(_("Відтворити"), "win.tile-play", key))
         first.append_item(menu_item(_("Відкрити"), "win.tile-open", key))
         menu.append_section(None, first)
-        if is_playlist(key):
+        if is_blocked_list(key):
+            pass
+        elif is_playlist(key):
             favorites = os.path.basename(key) == FAVORITES + PLAYLIST_EXT
             edit = Gio.Menu()
             if not favorites:
@@ -1658,6 +1685,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             more = Gio.Menu()
             more.append_item(menu_item(_("Редагувати альбом…"), "win.tile-edit", key))
             more.append_item(menu_item(_("Відкрити теку альбому"), "win.tile-folder", key))
+            more.append_item(menu_item(self.album_block_label(key), "win.tile-block", key))
             menu.append_section(None, more)
         point = tile.compute_point(self.lib_stack, Graphene.Point().init(x, y))
         popup_menu(self.tile_menu, menu, point[1].x, point[1].y)
@@ -1693,7 +1721,11 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         first.append(_("Відтворити"), "win.tracks-play")
         menu.append_section(None, first)
         self.add_menu(menu, links)
-        if self.playlist_open():
+        block = Gio.Menu()
+        block.append(self.block_label(links), "win.tracks-block")
+        self.enable("tracks-block", self.can_block(links))
+        menu.append_section(None, block)
+        if self.playlist_open() and not self.is_blocked_open():
             more = Gio.Menu()
             more.append(_("Вище"), "win.tracks-up")
             more.append(_("Нижче"), "win.tracks-down")
@@ -1883,6 +1915,9 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.rows = [TrackRow(t, album_artist, reorder) for t in self.info.get("tracks", [])]
         for row in self.rows:
             self.tracks.append(row)
+            if self.track_blocked(row.track, self.info) and not row.track.get("missing"):
+                row.set_state(_("у чорному списку"), "dialog-cancel")
+                row.add_css_class("dim-label")
         self.update_states()
         self.update_player()
 

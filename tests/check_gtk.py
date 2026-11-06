@@ -171,6 +171,46 @@ def scenario(tmp):
     win.remove_entry(new)
     assert not win.album_open()
 
+    # наступний альбом, сортування і чорний список у вікні
+    second = f"{lib}/Band/Second"
+    os.makedirs(second)
+    tone(f"{second}/01 - Next.flac")
+    win.rescan()
+    assert spin(3, lambda: second in win.lib_list.tiles), "другий альбом"
+    win.lookup_action("sort").activate(GLib.Variant("s", "title"))
+    assert win.sort == "title" and list(win.lib_list.tiles) == [album, second]
+    win.lookup_action("sort").activate(GLib.Variant("s", "added"))
+    assert win.lookup_action("sort").get_state().get_string() == "added"
+    win.lookup_action("sort").activate(GLib.Variant("s", "title"))
+    win.open_tile(album)
+    win.on_play()
+    assert spin(5, lambda: win.cur == 2), "другий трек"
+    assert spin(5, lambda: win.queue.get("ALBUM_DIR") == second), "наступний альбом"
+    assert win.title_label.get_text() == "Second", "показаний альбом іде за тим, що грає"
+    win.stop_playback()
+    win.toggle_album_block(second)
+    assert spin(3, lambda: second in win.block_grid.tiles and second not in win.lib_list.tiles), "плитка перейшла"
+    badge = win.lib_stack.get_page(win.block_grid).get_badge_number()
+    assert badge == win.blocked_count() > 0, "кружок показує кількість треків"
+    win.toggle_album_block(second)
+    assert spin(3, lambda: second in win.lib_list.tiles and not win.block_grid.tiles)
+    win.open_tile(album)
+    win.toggle_block([win.track_link(1, win.info)])
+    assert win.rows[0].state.get_text() == "blacklisted" and win.playable(win.info) == [2]
+    win.tracks.select_row(win.rows[0])
+    assert spin(3, lambda: core.blocked_path(lib) in win.block_grid.tiles), "плитка пісень"
+    win.open_tile(core.blocked_path(lib))
+    win.tracks.select_row(win.rows[0])
+    win.block_chosen([])
+    assert spin(3, lambda: not win.block_grid.tiles and not win.blocked), "список порожній"
+    assert win.lib_stack.get_page(win.block_grid).get_badge_number() == 0, "порожній список без кружка"
+    win.close_album()
+    win.rescan()
+    os.remove(f"{second}/01 - Next.flac")
+    os.rmdir(second)
+    win.rescan()
+    assert spin(3, lambda: list(win.lib_list.tiles) == [album]), "другий альбом прибрано"
+
     # вставлений диск: скопійований трек грає, вийнятий диск зупиняє
     with open(os.environ["FAKE_TRACKS"], "w") as f:
         f.write("2\n")

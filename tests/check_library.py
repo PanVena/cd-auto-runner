@@ -95,6 +95,221 @@ def check_playlist(root):
     assert core.safe_name(" ../a\\b ") == "-a-b", "назва — це ім'я файлу"
 
 
+def check_sort():
+    def album(artist, name, year="", added=0):
+        return {"ALBUM_ARTIST": artist, "ALBUM": name, "YEAR": year, "ADDED": added, "tracks": []}
+    names = lambda mode, items: [a["ALBUM"] for a in core.sort_albums(items, mode)]
+    items = [album("Б", "Я", "1999", 5), album("А", "Ґ", "2004", 1), album("В", "Д", "", 9), album("В", "Г", "2004", 2)]
+    assert names("artist", items) == ["Ґ", "Я", "Г", "Д"]
+    assert names("title", items) == ["Г", "Ґ", "Д", "Я"], "ґ — одразу за г"
+    assert names("added", items) == ["Д", "Я", "Г", "Ґ"], "новіші першими"
+    assert names("year", items) == ["Ґ", "Г", "Я", "Д"], "без року — вкінці"
+    words = ["яблуко", "їжак", "йод", "іній", "ирій", "єнот", "дім", "ґанок", "гора", "Жук"]
+    assert sorted(words, key=core.sort_key) == ["гора", "ґанок", "дім", "єнот", "Жук", "ирій", "іній", "їжак", "йод", "яблуко"]
+
+
+class Player(core.Controller):
+    """Логіка програвача без вікна: mpv — заглушка, що запам'ятовує файли."""
+
+    class Mpv:
+        def __init__(self):
+            self.played = []
+
+        def load(self, path):
+            self.played.append(os.path.basename(path))
+
+        def stop(self):
+            pass
+
+    def __init__(self, root):
+        self.root, self.store, self.toasts = root, {}, []
+        self.mpv, self.mpris = self.Mpv(), None
+        self.init_state()
+        self.rescan()
+
+    def library_root(self):
+        return self.root
+
+    def ui_get(self, key, default):
+        return self.store.get(key, default)
+
+    def ui_put(self, key, value):
+        self.store[key] = value
+
+    def rescan(self):
+        albums = core.scan_library(self.root)
+        for a in albums:
+            a["thumb"], a["stamp"] = None, 0
+        blocked = core.read_playlist(core.blocked_path(self.root), self.root)
+        blocked["thumb"], blocked["stamp"] = None, 0
+        self.take_scan(albums, [], blocked)
+
+    def toast(self, text):
+        self.toasts.append(text)
+
+    def on_position(self, _sec):
+        pass
+
+    on_duration = on_position
+
+    def nothing(self, *_a):
+        pass
+
+    update_player = show_disc = update_states = fill_library = fill_tracks = load_times = nothing
+    select_tracks = write_want = nothing
+
+
+def end_track(player):
+    player.on_ended("eof")
+    return player.mpv.played[-1] if player.cur is not None else None
+
+
+def check_player(root):
+    """Наступний альбом, повтор і чорний список — на тих самих об'єктах, що й у вікнах."""
+    def album(name, *tracks):
+        touch(os.path.join(root, name), *tracks)
+        return os.path.join(root, name)
+    a = album("A", "01 - a1.flac", "02 - a2.flac")
+    b = album("B", "01 - b1.flac")
+    c = album("C", "01 - c1.flac", "02 - c2.flac")
+    d = album("D", "01 - d1.flac")
+    player = Player(root)
+    player.set_sort("title")
+
+    def start(folder, n=1):
+        assert player.open_album(folder)
+        player.adopt()
+        player.play_track(n)
+
+    # кінець альбому — наступний у порядку бібліотеки; показаний альбом іде слідом
+    start(a, 2)
+    assert end_track(player) == "01 - b1.flac" and player.info["ALBUM_DIR"] == b
+    assert player.queue["ALBUM_DIR"] == b and player.cur == 1
+
+    # переглядають інший альбом — він лишається показаним
+    player.open_album(a)
+    assert end_track(player) == "01 - c1.flac"
+    assert player.queue["ALBUM_DIR"] == c and player.info["ALBUM_DIR"] == a
+    player.stop_playback()
+
+    # повтор: альбом не змінюється
+    player.set_loop("Playlist")
+    start(a, 2)
+    assert end_track(player) == "01 - a1.flac" and player.queue["ALBUM_DIR"] == a
+    player.set_loop("Track")
+    start(a, 2)
+    assert end_track(player) == "02 - a2.flac" and player.next_album() is None
+    player.set_loop("None")
+
+    # «Далі» на останньому треку теж веде до наступного альбому
+    start(a, 2)
+    player.next_track()
+    assert player.queue["ALBUM_DIR"] == b and player.mpv.played[-1] == "01 - b1.flac"
+
+    # інший порядок бібліотеки — інший наступний альбом; останній альбом — кінець
+    player.set_sort("added")
+    os.utime(os.path.join(a, "01 - a1.flac"), (3000, 3000))
+    os.utime(os.path.join(a, "02 - a2.flac"), (3000, 3000))
+    os.utime(os.path.join(b, "01 - b1.flac"), (2000, 2000))
+    os.utime(os.path.join(c, "01 - c1.flac"), (1000, 1000))
+    os.utime(os.path.join(d, "01 - d1.flac"), (4000, 4000))
+    player.rescan()
+    assert [x["ALBUM_DIR"] for x in player.albums if x["ALBUM_DIR"] in (a, b, c, d)][:4] == [d, a, b, c]
+    player.set_sort("title")
+    start(d)
+    assert end_track(player) is None, "після останнього альбому — зупинка"
+
+    # плейліст закінчується сам
+    mix = os.path.join(core.playlists_dir(root), "Mix" + core.PLAYLIST_EXT)
+    core.write_m3u(mix, [(os.path.join(a, "01 - a1.flac"), "a1")])
+    start(mix)
+    assert end_track(player) is None, "плейліст не переходить на альбом"
+
+    # чорний список: альбом зникає з плиток і пропускається, але не грає далі сам
+    player.toggle_album_block(b)
+    assert core.read_m3u(core.blocked_albums_path(root))[0][0] == b
+    albums, _lists, blocked, _cur = player.library_rows()
+    assert b not in [r[0] for r in albums[0]] and [r[0] for r in blocked[0]] == [b]
+    in_album = len(next(x for x in player.albums if x["ALBUM_DIR"] == b)["tracks"])
+    assert player.blocked_count() == in_album, "лічильник рахує треки альбому"
+    start(a, 2)
+    assert end_track(player) == "01 - c1.flac", "заблокований альбом пропущено"
+    assert end_track(player) == "02 - c2.flac"
+    player.stop_playback()
+    player.toggle_album_block(b)
+    assert not player.blocked_albums and b in [r[0] for r in player.library_rows()[0][0]]
+
+    # чорний список: пісня пропускається, поточна — змінюється одразу
+    link = player.track_link(2, core.read_album(c, root))
+    player.open_album(c)
+    player.toggle_block([link])
+    assert player.playable(player.info) == [1]
+    start(c, 2)
+    assert player.cur is None and any("чорному" in t or "blacklist" in t for t in player.toasts), "трек не грає"
+    start(a, 2)
+    assert end_track(player) == "01 - b1.flac"
+    assert end_track(player) == "01 - c1.flac"
+    assert end_track(player) == "01 - d1.flac", "заблокований трек пропущено"
+    player.stop_playback()
+    player.open_album(c)
+    player.toggle_block([link])
+    assert not player.blocked and player.playable(player.info) == [1, 2]
+
+    start(a, 1)
+    player.toggle_block([player.track_link(1, player.info)])
+    assert player.cur == 2 and player.mpv.played[-1] == "02 - a2.flac", "поточний трек у списку — наступний"
+    player.toggle_block([player.track_link(2, player.info)])
+    assert player.queue["ALBUM_DIR"] == b, "альбом скінчився — наступний альбом"
+    player.stop_playback()
+
+    # пісня, заблокована прямо з плейліста, потрапляє до списку пісень
+    one, two = os.path.join(c, "01 - c1.flac"), os.path.join(d, "01 - d1.flac")
+    list_b = os.path.join(core.playlists_dir(root), "Blocked" + core.PLAYLIST_EXT)
+    core.write_m3u(list_b, [(one, "c1"), (two, "d1"), (os.path.join(b, "01 - b1.flac"), "b1")])
+    start(list_b)
+    assert player.playable(player.info) == [1, 2, 3]
+    player.toggle_block([player.track_link(1, player.info)])
+    assert one in {e[0] for e in core.read_m3u(core.blocked_path(root))}, "пісня з плейліста в списку"
+    assert player.cur == 2 and player.mpv.played[-1] == "01 - d1.flac"
+    assert one in [t["path"] for t in player.blocked_list["tracks"]]
+    assert player.blocked_count() == 3, "дві пісні з альбому A і одна зі щойно доданих"
+    player.toggle_album_block(a)
+    assert player.blocked_count() == 3, "пісня з заблокованого альбому не рахується двічі"
+    player.toggle_album_block(a)
+    player.toggle_block([player.track_link(1, player.info)])
+    assert one not in player.blocked
+
+    # трек заблокованого альбому в плейлісті заблокований теж; сам альбом можна відтворити
+    player.toggle_album_block(d)
+    assert player.playable(player.info) == [1, 3], "трек альбому з чорного списку не грає"
+    assert player.cur == 3 and player.mpv.played[-1] == "01 - b1.flac", "поточний трек змінився"
+    link = player.track_link(2, player.info)
+    assert player.block_label([link]) == core._("Прибрати з чорного списку") and not player.can_block([link])
+    assert player.can_block([link, player.track_link(1, player.info)])
+    player.stop_playback()
+    start(d)
+    assert player.cur == 1 and player.mpv.played[-1] == "01 - d1.flac", "альбом вручну"
+    player.stop_playback()
+    player.open_album(list_b)
+    player.toggle_album_block(d)
+    assert player.playable(player.info) == [1, 2, 3] and player.can_block([link])
+    os.remove(list_b)
+
+    # список пісень — плитка, але не плейліст
+    player.rescan()
+    albums, _lists, blocked, _cur = player.library_rows()
+    assert blocked[0][0][0] == core.blocked_path(root) and blocked[0][0][1]
+    assert core.blocked_path(root) not in [p["PLAYLIST"] for p in core.list_playlists(root)]
+    assert not any(core.is_blocked_list(p["PLAYLIST"]) for p in core.list_playlists(root))
+    player.show_tile(core.blocked_path(root))
+    assert player.is_blocked_open() and not player.playable(player.info)
+
+    # вилучення зі списку пісень, навіть якщо файл зник
+    player.selected_tracks = lambda: [1, 2]
+    player.block_chosen([])
+    assert core.read_m3u(core.blocked_path(root)) == [] and not player.blocked
+
+
 def check_relink(root):
     """_cdar_relink_playlists: перейменований під час «Ввести назви» трек не губиться з плейлістів."""
     path = os.path.join(core.playlists_dir(root), "Relink" + core.PLAYLIST_EXT)
@@ -107,6 +322,16 @@ def check_relink(root):
                             CDAR_TRACKS="1", CDAR_NAME="test"))
     assert [e[0] for e in core.read_m3u(path)] == [new, other]
     assert not os.path.exists(path + ".part")
+
+    # теки альбомів у прихованому чорному списку теж оновлюються
+    albums = core.blocked_albums_path(root)
+    core.write_m3u(albums, [(os.path.dirname(old), "x")])
+    subprocess.run(["bash", "-c", 'source "$1"; _cdar_relink_playlists "$2" "$3"', "_",
+                    os.path.join(ROOT, "players", "_lib.sh"), os.path.dirname(old), os.path.dirname(new)], check=True,
+                   env=dict(os.environ, CDAR_LIBRARY_DIR=root, CDAR_EXEC="true", CDAR_DEVICE="/dev/null",
+                            CDAR_TRACKS="1", CDAR_NAME="test"))
+    assert [e[0] for e in core.read_m3u(albums)] == [os.path.dirname(new)]
+    os.remove(albums)
 
 
 def check_mosaic():
@@ -149,6 +374,8 @@ with tempfile.TemporaryDirectory() as tmp:
     library = os.path.join(tmp, "Музика")
     for check in (check_digital_album, check_ripped_album, check_playlist, check_relink):
         check(library)
+    check_sort()
+    check_player(os.path.join(tmp, "Плеєр"))
 gui = load("gui")
 check_mosaic()
 print("бібліотека: гаразд / library: ok")

@@ -13,6 +13,8 @@ Tested on Fedora 44 and 45 with GNOME 50 and KDE Plasma 6.7 and 6.8.
 - Rips discs to your Music folder (FLAC, Opus, Ogg, MP3, WAV) with tags and cover art.
 - Track titles from MusicBrainz, CD-TEXT or entered by hand.
 - Library, playlists and your own albums from digital copies.
+- Albums sorted by artist, title, date added or year.
+- A blacklist: albums leave the library and songs are skipped.
 - Disc actions in Disks & Devices (Plasma) and the app icon menu (GNOME).
 - Media keys and desktop media controls (MPRIS).
 - English and Ukrainian interface.

@@ -52,7 +52,6 @@ EN = {
     "Зупинити": "Stop",
     "Ще": "More",
     "Відкрити теку альбому": "Open the album folder",
-    "Відкрити бібліотеку музики": "Open the music library",
     "Додати диск у MusicBrainz": "Add the disc to MusicBrainz",
     "Видалити тимчасові файли": "Remove temporary files",
     "Оновити": "Refresh",
@@ -226,6 +225,21 @@ EN = {
     "Пізніше": "Not now",
     "Гаразд": "OK",
     "Диск": "Disc",
+    "Чорний список": "Blacklist",
+    "Додати до чорного списку": "Add to the blacklist",
+    "Прибрати з чорного списку": "Remove from the blacklist",
+    "Додано до чорного списку": "Added to the blacklist",
+    "Прибрано з чорного списку": "Removed from the blacklist",
+    "у чорному списку": "blacklisted",
+    "Пісні з чорного списку": "Blacklisted songs",
+    "Трек {n} у чорному списку.": "Track {n} is blacklisted.",
+    "Тут будуть альбоми й пісні з чорного списку: альбоми зникають із бібліотеки, а пісні пропускаються.":
+        "Blacklisted albums and songs will appear here: such albums leave the library and such songs are skipped.",
+    "Сортування": "Sort order",
+    "За виконавцем": "By artist",
+    "За назвою": "By title",
+    "За датою додавання": "By date added",
+    "За роком": "By year",
 }
 
 
@@ -304,6 +318,15 @@ LOOP_MODES = {
     "None": ("media-playlist-repeat", "Повтор: вимкнено"),
     "Playlist": ("media-playlist-repeat", "Повтор: увесь диск"),
     "Track": ("media-playlist-repeat-song", "Повтор: один трек"),
+}
+
+
+# порядок альбомів у бібліотеці: ключ налаштування і підпис у меню
+ALBUM_SORTS = {
+    "artist": "За виконавцем",
+    "title": "За назвою",
+    "added": "За датою додавання",
+    "year": "За роком",
 }
 
 
@@ -396,7 +419,7 @@ if dbus is not None:
                 "Volume": dbus.Double(w.volume() / 100),
                 "Position": dbus.Int64(int(w.pos * 1_000_000) if playing else 0),
                 "LoopStatus": dbus.String(w.loop), "Shuffle": dbus.Boolean(w.shuffle),
-                "CanGoNext": dbus.Boolean(w.neighbor(1) is not None),
+                "CanGoNext": dbus.Boolean(w.neighbor(1) is not None or w.next_album() is not None),
                 "CanGoPrevious": dbus.Boolean(n is not None),
                 "CanPlay": dbus.Boolean(ready), "CanPause": dbus.Boolean(ready),
                 "CanSeek": dbus.Boolean(playing), "CanControl": dbus.Boolean(True),
@@ -544,6 +567,19 @@ PLAYLIST_EXT = ".m3u8"
 FAVORITES = "Favorites"
 
 
+# Чорний список — приховані файли поруч із плейлістами: крапка не дає їм стати плейлістами,
+# safe_name не дасть так назвати власний плейліст, а _cdar_relink_playlists оновлює і їх.
+# Пісні — звичайний плейліст, альбоми — такий самий список, але з тек.
+BLOCKED = ".Blacklist"
+
+
+BLOCKED_ALBUMS = ".Blacklist-albums"
+
+
+# у кирилиці Unicode ставить ґ, є, і, ї після «я»; порядок української абетки — зразу за г, е, и
+COLLATE = str.maketrans({"ґ": "г\uffff", "є": "е\uffff", "і": "и\uffff", "ї": "и\uffff\uffff"})
+
+
 def read_disc():
     """Відомості про вставлений диск (cd-auto-runner info); може чекати на MusicBrainz до двох хвилин."""
     code, out, err = run("info", timeout=120)
@@ -632,6 +668,34 @@ def write_marker(folder, head, rows):
     os.replace(f"{path}.part", path)
 
 
+def sort_key(text):
+    return text.casefold().translate(COLLATE)
+
+
+def sort_albums(albums, mode):
+    """Новий список альбомів у порядку mode (ALBUM_SORTS); дати й роки — від нових, без року — вкінці."""
+    def name(a):
+        return sort_key(a["ALBUM_ARTIST"]), sort_key(a["ALBUM"])
+    keys = {
+        "title": lambda a: name(a)[::-1],
+        "added": lambda a: (-a.get("ADDED", 0), *name(a)),
+        "year": lambda a: (-(tag_number(a["YEAR"]) or 0), *name(a)),
+    }
+    return sorted(albums, key=keys.get(mode, name))
+
+
+def added_time(album):
+    """Коли альбом потрапив у бібліотеку. Час файлів, а не теки: її міняють мітка й обкладинка,
+    а час створення файлу Python у Linux не дає."""
+    stamps = []
+    for track in album["tracks"]:
+        try:
+            stamps.append(os.path.getmtime(track["path"]))
+        except OSError:
+            pass
+    return min(stamps, default=0)
+
+
 def scan_library(root, seen=None):
     """Альбоми бібліотеки: теки з аудіо до трьох рівнів углиб (Виконавець/Альбом/Диск 1).
     У seen (якщо є) дописує всі переглянуті теки."""
@@ -644,9 +708,9 @@ def scan_library(root, seen=None):
         dirs[:] = [d for d in dirs if not d.startswith(".")] if depth < 3 else []
         album = read_album(folder, root) if depth else None
         if album:
+            album["ADDED"] = added_time(album)
             albums.append(album)
-    albums.sort(key=lambda a: (a["ALBUM_ARTIST"].casefold(), a["ALBUM"].casefold()))
-    return albums
+    return sort_albums(albums, "artist")
 
 
 # --- плейлісти: файли .m3u8 у теці бібліотеки, шляхи до треків — відносні ----------------
@@ -658,9 +722,21 @@ def favorites_path(root):
     return os.path.join(playlists_dir(root), FAVORITES + PLAYLIST_EXT)
 
 
+def blocked_path(root):
+    return os.path.join(playlists_dir(root), BLOCKED + PLAYLIST_EXT)
+
+
+def blocked_albums_path(root):
+    return os.path.join(playlists_dir(root), BLOCKED_ALBUMS + PLAYLIST_EXT)
+
+
+def is_blocked_list(path):
+    return os.path.basename(path) == BLOCKED + PLAYLIST_EXT
+
+
 def playlist_name(path):
     stem = os.path.splitext(os.path.basename(path))[0]
-    return _("Улюблене") if stem == FAVORITES else stem
+    return {FAVORITES: _("Улюблене"), BLOCKED: _("Пісні з чорного списку")}.get(stem, stem)
 
 
 def is_playlist(path):
@@ -734,7 +810,8 @@ def list_playlists(root):
     """Усі плейлісти за назвою; «Улюблене» є завжди й стоїть першим, навіть без файлу."""
     folder, favorites = playlists_dir(root), favorites_path(root)
     try:
-        paths = [e.path for e in os.scandir(folder) if is_playlist(e.name) and e.is_file()]
+        paths = [e.path for e in os.scandir(folder)
+                 if is_playlist(e.name) and not e.name.startswith(".") and e.is_file()]
     except OSError:
         paths = []
     paths = sorted((p for p in paths if p != favorites), key=str.casefold)
@@ -776,19 +853,20 @@ class ThumbCache:
         return self.thumbs[path, stamp], stamp
 
     def scan(self, root):
-        """(альбоми, плейлісти, усі теки бібліотеки) з обкладинками."""
+        """(альбоми, плейлісти, пісні з чорного списку, усі теки бібліотеки) з обкладинками."""
         folders = []
         albums = scan_library(root, folders)
         for album in albums:
             album["thumb"], album["stamp"] = self.thumb(album["COVER"])
         playlists = list_playlists(root)
-        for playlist in playlists:
+        blocked = read_playlist(blocked_path(root), root)
+        for playlist in (*playlists, blocked):
             if playlist["COVER"]:
                 playlist["thumb"], playlist["stamp"] = self.thumb(playlist["COVER"])
             else:
                 covers = dict.fromkeys(t["cover"] for t in playlist["tracks"] if t.get("cover"))
                 playlist["thumb"], playlist["stamp"] = self.mosaic((c, self.thumb(c)[0]) for c in covers)
-        return albums, playlists, folders
+        return albums, playlists, blocked, folders
 
 
 def read_tags(path):
@@ -881,6 +959,12 @@ class Controller:
         self.albums = []
         self.playlists = []
         self.favs = set()           # шляхи улюблених треків
+        self.blocked = set()        # шляхи треків із чорного списку
+        self.blocked_albums = set() # теки альбомів із чорного списку
+        self.blocked_list = {}      # пісні з чорного списку як плейліст (плитка)
+        self.sort = self.ui_get("sort", "artist")        # порядок альбомів (ALBUM_SORTS)
+        if self.sort not in ALBUM_SORTS:
+            self.sort = "artist"
         self.lib_done = -1          # скільки треків диска скопійовано (нові файли — новий перегляд)
         self.last_tracks = -1
         self.loading = False
@@ -897,6 +981,7 @@ class Controller:
         self.pending_play = play    # відтворити, щойно прочитано диск
         self.rip_started = 0.0
         self.titles_stamp = 0
+        self.load_favorites()       # диск може заграти раніше, ніж закінчиться перегляд бібліотеки
 
     def builtin_selected(self):
         """Обрано вбудований програвач — явно або як типовий (програвач ще не обирали)."""
@@ -919,7 +1004,7 @@ class Controller:
         self.stop_playback()            # щоб не грали обидва
         if self.album_open():
             self.toast(_("Запускаю {name}…", name=read_config().get("PLAYER_NAME", "")))
-            self.action("open", extra=[t["path"] for t in self.info["tracks"][n - 1:] if not t.get("missing")])
+            self.action("open", extra=[self.track_title(i, self.info)["path"] for i in self.playable(self.info) if i >= n])
         else:
             self.action("play")
 
@@ -1019,6 +1104,9 @@ class Controller:
         if tracks[n - 1].get("missing"):
             self.toast(_("Файлу треку {n} більше немає.", n=n))
             return
+        if self.track_blocked(tracks[n - 1], self.queue):
+            self.toast(_("Трек {n} у чорному списку.", n=n))
+            return
         self.cur = n
         self.pos = 0.0
         path = self.track_file(n)
@@ -1059,8 +1147,8 @@ class Controller:
             self.mpv.toggle()
 
     def playable(self, info):
-        """Номери треків, які можна грати: у плейлісті файл треку міг зникнути."""
-        return [t["n"] for t in info.get("tracks", []) if not t.get("missing")]
+        """Номери треків, які можна грати: у плейлісті файл треку міг зникнути, а трек — бути в чорному списку."""
+        return [t["n"] for t in info.get("tracks", []) if not t.get("missing") and not self.track_blocked(t, info)]
 
     def play_order(self):
         tracks = self.playable(self.queue)
@@ -1086,6 +1174,43 @@ class Controller:
         if 0 <= i < len(order):
             return order[i]
         return order[i % len(order)] if self.loop == "Playlist" else None
+
+    def upcoming(self):
+        """Треки, які ще мають заграти в цьому альбомі, по черзі."""
+        order = self.play_order()
+        if self.cur not in order:
+            return []
+        i = order.index(self.cur)
+        return order[i + 1:] + (order[:i] if self.loop == "Playlist" else [])
+
+    def next_album(self):
+        """Альбом, який заграє після поточного: наступний у порядку бібліотеки, лише без повтору.
+        Плейліст і вставлений диск закінчуються самі: вони не мають місця серед альбомів."""
+        key = self.queue.get("ALBUM_DIR")
+        if self.cur is None or self.loop != "None" or not key or self.queue.get("PLAYLIST"):
+            return None
+        keys = [a["ALBUM_DIR"] for a in self.albums]
+        if key not in keys:
+            return None
+        return next((a for a in self.albums[keys.index(key) + 1:]
+                     if not self.album_blocked(a["ALBUM_DIR"]) and self.playable(a)), None)
+
+    def play_next_album(self):
+        """Переходить на наступний альбом; показаний альбом змінюється слідом за ним.
+        False — далі грати нема чого."""
+        following = self.next_album()
+        album = following and read_album(following["ALBUM_DIR"], self.library_root())
+        if not album:
+            return False
+        shown = self.showing_queue()
+        self.queue, self.order, self.cur = album, [], None
+        if shown:
+            self.info = album
+            self.show_disc()
+            self.update_states()
+        self.load_times(album["ALBUM_DIR"], [t["path"] for t in album["tracks"]])
+        self.play_track(self.first_track())
+        return True
 
     def set_shuffle(self, on):
         self.shuffle = bool(on)
@@ -1121,6 +1246,8 @@ class Controller:
         n = self.neighbor(1)
         if n is not None:
             self.play_track(n)
+        else:
+            self.play_next_album()
 
     def on_play(self):
         """Кнопка «Відтворити»: вбудований програвач — у цьому вікні, інакше — обраний програвач."""
@@ -1171,7 +1298,7 @@ class Controller:
             n = self.cur if self.loop == "Track" else self.neighbor(1)
             if n is not None:
                 self.play_track(n)
-            else:
+            elif not self.play_next_album():
                 self.stop_playback()
         elif reason == "error" and self.cur is not None:
             self.toast(_("Не вдалося відтворити трек {n}.", n=self.cur))
@@ -1281,7 +1408,116 @@ class Controller:
         self.update_player()
 
     def load_favorites(self):
-        self.favs = {path for path, _label in read_m3u(favorites_path(self.library_root()))}
+        root = self.library_root()
+        self.favs = {path for path, _label in read_m3u(favorites_path(root))}
+        self.blocked = {path for path, _label in read_m3u(blocked_path(root))}
+        self.blocked_albums = {path for path, _label in read_m3u(blocked_albums_path(root))}
+
+    def take_scan(self, albums, playlists, blocked):
+        self.albums, self.playlists, self.blocked_list = sort_albums(albums, self.sort), playlists, blocked
+        self.load_favorites()
+
+    def set_sort(self, mode):
+        if mode in ALBUM_SORTS:
+            self.sort = mode
+            self.ui_put("sort", mode)
+            self.albums = sort_albums(self.albums, mode)
+            self.fill_library()
+            self.update_player()        # наступний альбом тепер інший
+
+    def by_album(self, file, info):
+        """Трек заблокований разом з альбомом. Це діє лише в плейлісті: сам альбом можна
+        відтворити вручну, а вставлений диск — це не бібліотека."""
+        return bool(info.get("PLAYLIST")) and os.path.dirname(file) in self.blocked_albums
+
+    def file_blocked(self, file, info):
+        return file in self.blocked or self.by_album(file, info)
+
+    def track_blocked(self, track, info):
+        if not self.blocked and not self.blocked_albums:
+            return False
+        path = track.get("path") or self.library_file(track["n"], info)
+        return bool(path) and self.file_blocked(os.path.normpath(path), info)
+
+    def album_blocked(self, folder):
+        return os.path.normpath(folder) in self.blocked_albums
+
+    def blocked_count(self):
+        """Скільки треків у чорному списку: окремі пісні й треки альбомів, кожен один раз."""
+        files = {t["path"] for t in self.blocked_list.get("tracks", [])}
+        for album in self.albums:
+            if self.album_blocked(album["ALBUM_DIR"]):
+                files.update(t["path"] for t in album["tracks"])
+        return len(files)
+
+    def is_blocked_open(self):
+        return is_blocked_list(self.playlist_open())
+
+    def block_label(self, links):
+        """Підпис дії чорного списку для цих треків."""
+        on = self.is_blocked_open() or (bool(links) and all(self.file_blocked(link[0], self.info) for link in links))
+        return _("Прибрати з чорного списку") if on else _("Додати до чорного списку")
+
+    def can_block(self, links):
+        """Пісню, заблоковану лише разом з альбомом, окремо зі списку не прибрати."""
+        return self.is_blocked_open() or any(link[0] in self.blocked or not self.by_album(link[0], self.info)
+                                             for link in links)
+
+    def album_block_label(self, folder):
+        return _("Прибрати з чорного списку") if self.album_blocked(folder) else _("Додати до чорного списку")
+
+    def toggle_block(self, links):
+        """Чорний список для треків. Якщо в нього потрапив поточний трек — іде далі."""
+        path = blocked_path(self.library_root())
+        files = {link[0] for link in links}
+        rest = self.upcoming()
+        entries = read_m3u(path)
+        removing = all(self.file_blocked(file, self.info) for file in files)
+        if removing:
+            entries = [e for e in entries if e[0] not in files]
+        else:
+            known = {file for file, _label in entries}
+            entries += [link for link in {link[0]: link for link in links}.values() if link[0] not in known]
+        if not self.store_playlist(path, entries):
+            return
+        self.toast(_("Прибрано з чорного списку") if removing else _("Додано до чорного списку"))
+        self.after_block(rest)
+
+    def after_block(self, rest):
+        """Показує новий стан треків; якщо поточний тепер заблокований — грає наступний із rest."""
+        self.fill_tracks()
+        tracks = self.playable(self.queue)
+        self.order = [n for n in self.order if n in tracks]
+        if self.cur is not None and self.cur not in tracks:
+            n = next((n for n in rest if n in tracks), None)
+            if n is not None:
+                self.play_track(n)
+            elif not self.play_next_album():
+                self.stop_playback()
+
+    def block_chosen(self, links):
+        """Дія меню треків. У списку пісень — вилучення рядків: файл треку міг і зникнути."""
+        if self.is_blocked_open():
+            self.remove_tracks()
+        else:
+            self.toggle_block(links)
+
+    def toggle_album_block(self, folder):
+        """Чорний список для альбому: плитка переходить на вкладку списку. Сам альбом, якщо грає,
+        грає далі, а його треки в плейлісті — пропускаються."""
+        rest = self.upcoming()
+        path, key = blocked_albums_path(self.library_root()), os.path.normpath(folder)
+        entries = read_m3u(path)
+        removing = key in self.blocked_albums
+        if removing:
+            entries = [e for e in entries if e[0] != key]
+        else:
+            album = next((a for a in self.albums if a["ALBUM_DIR"] == folder), {})
+            entries.append((key, album.get("ALBUM", "")))
+        if self.store_playlist(path, entries):
+            self.toast(_("Прибрано з чорного списку") if removing else _("Додано до чорного списку"))
+            self.fill_library()
+            self.after_block(rest)
 
     def track_link(self, n, info):
         """(файл, підпис) треку для плейліста; None — файлу в бібліотеці немає (ще не скопійовано)."""
@@ -1437,9 +1673,9 @@ class Controller:
         return stamp
 
     def library_rows(self):
-        """Плитки для вікна: ((рядки, обкладинки) альбомів, те саме для плейлістів, відкрите зараз).
-        Рядок: ключ, назва, підпис, обкладинка, докладно, мітка часу, запасний значок, з диска."""
-        rows = []
+        """Плитки для вікна: ((рядки, обкладинки) альбомів, те саме для плейлістів і чорного списку,
+        відкрите зараз). Рядок: ключ, назва, підпис, обкладинка, докладно, мітка часу, запасний значок, з диска."""
+        rows, hidden = [], []
         if self.disc.get("tracks"):
             d = self.disc
             rows.append(("", d.get("ALBUM") or _("Аудіо-CD"), _("Диск у приводі"), d.get("COVER", ""),
@@ -1454,10 +1690,17 @@ class Controller:
             ripped = a["SOURCE"] == "ripped"
             kind = _("Записано з диска") if ripped else _("Цифровий альбом")
             more = " · ".join(x for x in (a["ALBUM_ARTIST"], a["YEAR"], _("треків: {n}", n=len(a["tracks"])), kind) if x)
-            rows.append((a["ALBUM_DIR"], a["ALBUM"], a["ALBUM_ARTIST"] or a["YEAR"], a["COVER"], more, a["stamp"],
-                         "media-optical-audio", ripped))
+            (hidden if self.album_blocked(a["ALBUM_DIR"]) else rows).append(
+                (a["ALBUM_DIR"], a["ALBUM"], a["ALBUM_ARTIST"] or a["YEAR"], a["COVER"], more, a["stamp"],
+                 "media-optical-audio", ripped))
             thumbs[a["ALBUM_DIR"]] = a["thumb"]
         albums = (rows, thumbs)
+        songs = self.blocked_list
+        if songs.get("tracks"):
+            hidden.insert(0, (songs["PLAYLIST"], songs["ALBUM"], _("треків: {n}", n=len(songs["tracks"])), "", "",
+                              songs["stamp"], "view-media-playlist", False))
+            thumbs[songs["PLAYLIST"]] = songs["thumb"]
+        blocked = (hidden, thumbs)
         rows, thumbs = [], {}
         for p in self.playlists:
             count = _("треків: {n}", n=len(p["tracks"]))
@@ -1465,7 +1708,7 @@ class Controller:
             rows.append((p["PLAYLIST"], p["ALBUM"], count, p["COVER"], "", p["stamp"],
                          "" if favorite else "view-media-playlist", False))
             thumbs[p["PLAYLIST"]] = p["thumb"]
-        return albums, (rows, thumbs), current
+        return albums, (rows, thumbs), blocked, current
 
     def now_text(self):
         """Рядок «що грає» під елементами керування."""
@@ -1500,7 +1743,9 @@ class Controller:
         for t in i.get("tracks", []):
             n = t["n"]
             if lib and glob.glob(os.path.join(glob.escape(lib), f"{n:02d} - *")):
-                rows.append((_("у бібліотеці"), "emblem-ok-symbolic"))
+                blocked = self.track_blocked(t, i)
+                rows.append((_("у чорному списку"), "dialog-cancel") if blocked else
+                            (_("у бібліотеці"), "emblem-ok-symbolic"))
                 done += 1
             elif cache and os.path.exists(os.path.join(cache, f".done-{n}")):
                 rows.append((_("скопійовано"), "document-save"))

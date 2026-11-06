@@ -191,7 +191,7 @@ src = open(os.path.join(root, "gui", "gui.py"), encoding="utf-8").read()
 src = src[src.index("def heart_icon"):]
 calls = set(re.findall(r"""(?:icon|theme_icon)\(\s*((?:"[a-z-]+"(?:,\s*)?)+)""", src))
 groups = {tuple(re.findall(r'"([a-z-]+)"', call)) for call in calls}      # другий і далі — запасні
-groups |= {(n,) for n in re.findall(r'"([a-z]+-[a-z-]+-symbolic)"', src)} | {("media-optical-audio",), ("pan-end-symbolic",), ("pan-down-symbolic",)}
+groups |= {(n,) for n in re.findall(r'"([a-z]+-[a-z-]+-symbolic)"', src)} | {("media-optical-audio",)}
 missing = sorted(str(g) for g in groups if gui.theme_icon(*g).isNull())
 assert not gui.app_icon().isNull(), "немає значка програми"
 assert len(groups) > 20, groups
@@ -279,8 +279,8 @@ fi''')
     assert not any(c.startswith("cd-paranoia") and "-d /dev/sr0 " in c and "-Q" not in c for c in sb.calls()), sb.calls()
 
 
-def check_sections(root):
-    """Картки налаштувань типово згорнуті й пам'ятають стан; ключ не залежить від мови."""
+def check_lib_tabs(root):
+    """Перемикач бібліотеки: кружок із кількістю, без нічого кружка немає, сигнал від setCurrentIndex."""
     code = r'''
 import importlib.util, os, sys
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -288,15 +288,60 @@ spec = importlib.util.spec_from_file_location("gui", os.path.join(sys.argv[1], "
 gui = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gui)
 app = gui.QApplication([])
-box, form = gui.section("Заголовок", "test")
-head = box.findChild(gui.QToolButton)
-assert box.body.isHidden() and not head.isChecked(), "типово згорнута"
-head.click()
-assert not box.body.isHidden(), "клік розгортає"
-box, form = gui.section("Title", "test")
-assert not box.body.isHidden(), "стан збережено"
+tabs = gui.LibTabs((("A", ("folder-music",)), ("B", ("folder-music",))))
+tabs.show()
+seen = []
+tabs.currentChanged.connect(seen.append)
+tabs.setCurrentIndex(1)
+assert tabs.currentIndex() == 1 and seen == [1]
+tabs.setCurrentIndex(7)
+assert tabs.currentIndex() == 1, "зайвий номер зі старих налаштувань"
+tabs.set_counts((1200, 0))
+one, two = tabs.group.button(0).badge, tabs.group.button(1).badge
+assert one.isVisible() and one.text() == "999+" and not two.isVisible()
+tabs.set_counts((0, 5))
+assert not one.isVisible() and two.isVisible() and two.text() == "5"
 '''
-    env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(root, "sections"))
+    env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(root, "tabs"))
+    p = subprocess.run([sys.executable, "-c", code, ROOT], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+
+
+def check_tile_columns(root):
+    """Плитки вміщуються впритул: QListView резервує смугу й рамку стилю, а не лише sizeHint смуги."""
+    code = r'''
+import importlib.util, os, sys
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+spec = importlib.util.spec_from_file_location("gui", os.path.join(sys.argv[1], "gui", "gui.py"))
+gui = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gui)
+from PySide6.QtWidgets import QProxyStyle, QStyle
+class Kvantum(QProxyStyle):
+    """Як Kvantum: рамка довкола вмісту, і QListView резервує її разом зі смугою."""
+    def pixelMetric(self, metric, option=None, widget=None):
+        return {QStyle.PM_DefaultFrameWidth: 3, QStyle.PM_ScrollBarExtent: 12}.get(metric, super().pixelMetric(metric, option, widget))
+    def styleHint(self, hint, option=None, widget=None, data=None):
+        return 1 if hint == QStyle.SH_ScrollView_FrameOnlyAroundContents else super().styleHint(hint, option, widget, data)
+app = gui.QApplication([])
+app.setStyle(Kvantum("Fusion"))
+for width in range(330, 900, 7):
+    grid = gui.AlbumGrid("")
+    grid.setFrameShape(gui.QFrame.NoFrame)
+    grid.setViewMode(gui.QListView.IconMode)
+    grid.setMovement(gui.QListView.Static)
+    grid.setResizeMode(gui.QListView.Adjust)
+    grid.setUniformItemSizes(True)
+    grid.resize(width, 900)
+    grid.show()
+    grid.addItems(["x"] * 12)
+    app.processEvents()
+    grid.doItemsLayout()
+    columns = len({grid.visualItemRect(grid.item(i)).x() for i in range(12)})
+    need = (width - 40) // (grid.tile.COVER + 2 * grid.tile.PAD + grid.GAP)
+    assert columns >= need, (width, columns, need, grid.gridSize())
+    grid.close()
+'''
+    env = dict(os.environ, XDG_CONFIG_HOME=os.path.join(root, "columns"))
     p = subprocess.run([sys.executable, "-c", code, ROOT], capture_output=True, text=True, env=env)
     assert p.returncode == 0, p.stdout + p.stderr
 
@@ -304,7 +349,7 @@ assert not box.body.isHidden(), "стан збережено"
 def main():
     with tempfile.TemporaryDirectory() as root:
         for check in (check_dialogs, check_terminal, check_launch, check_eject, check_gnome_autorun, check_own_entry,
-                      check_gui_choice, check_whole_disc, check_sections):
+                      check_gui_choice, check_whole_disc, check_lib_tabs, check_tile_columns):
             check(root)
             print(f"ok {check.__name__}")
     check_icons()
