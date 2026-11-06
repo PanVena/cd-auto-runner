@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/PanVena/cd-auto-runner/main/install
 
 | `--gui` | Вікно |
 |---|---|
-| `qt` | Qt (PySide6), зі значком у лотку |
+| `qt` | Qt (PySide6) |
 | `gtk` | GTK 4 (libadwaita), рідне для GNOME |
 | `none` | Без вікна: лише запуск обраного програвача, без вбудованого програвача |
 

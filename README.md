@@ -27,7 +27,7 @@ The installer asks for the language, the app window and the player. There are th
 
 | `--gui` | Window |
 |---|---|
-| `qt` | Qt (PySide6), with a tray icon |
+| `qt` | Qt (PySide6) |
 | `gtk` | GTK 4 (libadwaita), native to GNOME |
 | `none` | No window: just starts the chosen player, no built-in player |
 

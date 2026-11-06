@@ -119,7 +119,7 @@ if ((UNINSTALL)); then
   exec bash "$SRC/uninstall.sh" "${args[@]}"
 fi
 
-for f in "$APP" i18n.sh gui/gui.py gui/gui_gtk.py gui/cdar_core.py systemd/$APP.service desktop/$APP.desktop desktop/$APP.svg players/_lib.sh players/_generic.sh; do
+for f in "$APP" i18n.sh gui/gui.py gui/gui_gtk.py gui/cdar_core.py gui/cdar_tray.py systemd/$APP.service desktop/$APP.desktop desktop/$APP.svg players/_lib.sh players/_generic.sh; do
   [[ -f "$SRC/$f" ]] || fail "$(_ 'не знайдено файл %s — запускайте install.sh з теки проєкту.' "$SRC/$f")"
 done
 
@@ -152,8 +152,8 @@ else
   if ((!ASSUME_YES)) && [[ -t 0 ]]; then
     case "$GUI" in gtk) gui_default=GTK ;; qt) gui_default=Qt ;; *) gui_default="$(_ 'без вікна')" ;; esac
     printf '\n%s==>%s %s%s%s\n' "$c_ok" "$c_0" "$c_b" "$(_ 'Вікно програми')" "$c_0"
-    echo "  1) $(_ 'Qt (PySide6): для KDE Plasma, зі значком у системному лотку')$([[ $GUI == qt ]] && echo '  *')"
-    echo "  2) $(_ 'GTK 4 (libadwaita): для GNOME, рідний вигляд, без лотка')$([[ $GUI == gtk ]] && echo '  *')"
+    echo "  1) $(_ 'Qt (PySide6): для KDE Plasma')$([[ $GUI == qt ]] && echo '  *')"
+    echo "  2) $(_ 'GTK 4 (libadwaita): для GNOME, рідний вигляд')$([[ $GUI == gtk ]] && echo '  *')"
     echo "  3) $(_ 'Без вікна: лише служба, що запускає обраний програвач')$([[ $GUI == none ]] && echo '  *')"
     read -rp "  [1-3, Enter — $gui_default]: " n || n=""
     case "$n" in 1) GUI=qt ;; 2) GUI=gtk ;; 3) GUI=none ;; esac
@@ -277,7 +277,7 @@ tray_available() {
   gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
     --method org.freedesktop.DBus.NameHasOwner org.kde.StatusNotifierWatcher 2>/dev/null | grep -q true
 }
-if [[ "$GUI" == qt ]] && desktop_is GNOME && have gdbus && ! tray_available; then
+if [[ "$GUI" != none ]] && desktop_is GNOME && have gdbus && ! tray_available; then
   warn "$(_ 'у GNOME немає системного лотка без розширення AppIndicator (значок програми, згортання в лоток).')"
   if ((!SKIP_DEPS)) && ask "$(_ 'Встановити розширення AppIndicator (потрібен sudo)?')" n; then
     if pkg_install gnome-shell-extension-appindicator gnome-shell-extension-appindicator \
@@ -322,7 +322,7 @@ pkill -u "$USER" -f "$APP watch" 2>/dev/null || true
 
 install -Dm755 "$SRC/$APP" "$BIN";                          ok "$BIN"
 install -Dm644 "$SRC/i18n.sh" "$DATA_DIR/$APP/i18n.sh";     ok "$DATA_DIR/$APP/i18n.sh"
-for f in gui.py gui_gtk.py cdar_core.py; do
+for f in gui.py gui_gtk.py cdar_core.py cdar_tray.py; do
   if [[ "$GUI" == none ]]; then rm -f "$DATA_DIR/$APP/$f"; continue; fi
   install -Dm755 "$SRC/gui/$f" "$DATA_DIR/$APP/$f";         ok "$DATA_DIR/$APP/$f"
 done

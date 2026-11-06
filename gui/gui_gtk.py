@@ -2,14 +2,15 @@
 """CD Auto Runner — головне вікно для GNOME (GTK 4, libadwaita).
 
 Рівнозначна заміна вікна Qt (gui.py): обирається під час інсталяції (параметр GUI у налаштуваннях)
-і робить те саме — усе, крім вигляду, спільне з ним (cdar_core.py). Системного лотка в GTK немає,
-тож під час відтворення закрите вікно лише ховається, а музикою керують елементи MPRIS.
+і робить те саме — усе, крім вигляду, спільне з ним (cdar_core.py). Значок у лотку дає cdar_tray.py.
+Лотка немає зовсім (GNOME без розширення) — під час відтворення закрите вікно лише ховається,
+а музикою керують елементи MPRIS.
 
   gui_gtk.py [--play] [ПРИСТРІЙ]   --play — одразу відтворювати диск у вбудованому програвачі
 
 CD Auto Runner main window for GNOME (GTK 4, libadwaita). An equal alternative to the Qt window,
-chosen at install time. Everything but the looks is shared with it (cdar_core.py). GTK has no
-system tray: while music plays, closing the window only hides it.
+chosen at install time. Everything but the looks is shared with it (cdar_core.py); the tray icon
+is in cdar_tray.py. With no tray at all, closing the window while music plays only hides it.
 
 SPDX-License-Identifier: GPL-2.0-only
 Copyright (C) 2026 Pan Vena
@@ -38,14 +39,16 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gsk
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))     # запуск з -I: спільний модуль лежить поруч
 from cdar_core import (     # noqa: E402
-    APP, FAVORITES, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
+    APP, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
     album_from_tags, album_tags, connect_mpris, embedded_cover, favorites_path, fetch_cover, fmt_time, is_playlist,
     looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc, read_marker, run,
     runtime_dir, safe_name, script_version, self_bin, track_label, track_seconds, write_marker,
 )
+from cdar_tray import Tray  # noqa: E402
 
 APP_ID = "io.github.PanVena.CdAutoRunner"       # те саме значення — у StartupWMClass (install.sh)
 STATE_FILE = "gui-gtk.json"
+TRAY_HINT_MS, PLAY_HINT_MS = 6000, 8000
 TILE = 148
 COVER = 168
 
@@ -817,6 +820,18 @@ class Preferences(Adw.PreferencesDialog):
         self.lang.set_selected(next((i for i, (k, _t) in enumerate(self.LANGS) if k == LANG), 0))
         self.lang.connect("notify::selected", self.on_lang)
         group.add(self.lang)
+        available = win.tray.available()
+        self.tray = Adw.SwitchRow(title=_("Згортати в системний лоток під час закриття вікна"), use_markup=False,
+                                  active=win.state.get("tray", True), sensitive=available)
+        if not available and GNOME:
+            self.tray.set_subtitle(_("У GNOME для значка в лотку потрібне розширення AppIndicator (пакет gnome-shell-extension-appindicator)."))
+        self.tray.connect("notify::active", self.on_tray)
+        self.quiet = Adw.SwitchRow(title=_("Вставлений диск відтворювати у лотку, не відкриваючи вікна"), use_markup=False,
+                                   active=win.state.get("play_in_tray", False),
+                                   sensitive=available and self.tray.get_active())
+        self.quiet.connect("notify::active", lambda r, _p: win.state.put("play_in_tray", r.get_active()))
+        group.add(self.tray)
+        group.add(self.quiet)
         page.add(group)
 
         self.add(page)
@@ -830,6 +845,11 @@ class Preferences(Adw.PreferencesDialog):
         row = Adw.SwitchRow(title=title, use_markup=False)
         row.connect("notify::active", lambda r, _p: self.set_value(key, "yes" if r.get_active() else "no"))
         return row
+
+    def on_tray(self, row, _param):
+        self.win.state.put("tray", row.get_active())
+        self.quiet.set_sensitive(row.get_active())
+        self.win.tray.set_visible(row.get_active())
 
     def tick(self):
         self.update_service()
@@ -1090,7 +1110,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.busy = False
         self.mpris = None
         self.quitting = False       # «Вийти»: закриття вікна завершує програму, а не ховає її
-        self.backgrounded = False   # вікно закрито, а музика ще грає
+        self.backgrounded = False   # вікно закрито без лотка, а музика ще грає
         self.restart_lang = None    # мову змінено: main() перезапустить програму з новою мовою
         self.shut_down = False
         self.seeking = 0            # таймер відкладеного переходу на позицію
@@ -1119,6 +1139,9 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             self.mpv.on_ended = self.on_ended
             self.mpv.on_failed = self.on_mpv_failed
             self.mpris = connect_mpris(self)
+        self.tray = Tray(APP, "CD Auto Runner", APP, icon_folder() or "", self.tray_menu, self.toggle_window,
+                         self.toggle_play, self.set_startup_id, self.show_window)
+        self.tray.set_visible(self.state.get("tray", True))
         self.show_empty()
         self.update_player()
         self.rescan()
@@ -1137,6 +1160,8 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.toasts.add_toast(Adw.Toast(title=GLib.markup_escape_text(text), timeout=4))
 
     def warn(self, text, parent=None):
+        if not self.get_visible():      # вікно в лотку: діалог без нього не видно
+            self.show_window()
         alert(parent or self, _("Помилка"), text, (("cancel", _("Гаразд")),))
 
     def start_detached(self, program, args):
@@ -1146,7 +1171,8 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             print(e.message, file=sys.stderr)
 
     def played_unseen(self):
-        pass        # без лотка вікно відкривається завжди
+        if not self.get_visible():
+            self.announce_play()
 
     def load_info(self):
         self.info_jobs.put(self.on_info, read_disc)
@@ -1187,9 +1213,51 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.set_visible(True)
         self.present()
 
+    def toggle_window(self):
+        if self.get_visible() and not self.is_suspended():
+            self.set_visible(False)
+        else:
+            self.show_window()
+
     def quit_app(self):
         self.quitting = True
-        self.close()
+        if self.get_realized():
+            self.close()
+        else:                   # gtk_window_close() ігнорує вікно, якого ще не показували (грає в лотку)
+            self.shutdown()
+            self.destroy()
+
+    # --- лоток ----------------------------------------------------------------------------
+    def tray_menu(self):
+        playable = self.p_play.get_sensitive()
+        return [
+            (_("Показати / сховати вікно"), APP, True, self.toggle_window),
+            None,
+            (_("Відтворити / пауза"), "media-playback-start", playable, self.toggle_play),
+            (_("Попередній трек"), "media-skip-backward", playable, self.prev_track),
+            (_("Наступний трек"), "media-skip-forward", playable, self.next_track),
+            (_("Зупинити відтворення"), "media-playback-stop", playable, self.stop_playback),
+            None,
+            (_("Вийняти диск"), "media-eject", self.last_tracks > 0, self.eject),
+            (_("Про програму"), "help-about", True, self.about),
+            (_("Вийти"), "application-exit", True, self.quit_app),
+        ]
+
+    def tray_enabled(self):
+        return self.tray.shown()
+
+    def play_in_tray(self):
+        """Диск вставлено — грати, не відкриваючи вікна (якщо так налаштовано)."""
+        return self.tray_enabled() and self.state.get("play_in_tray", False)
+
+    def announce_play(self):
+        """Диск почав грати, а вікна не видно — сповіщення від значка в лотку (клік відкриває вікно)."""
+        if not self.tray_enabled() or read_config().get("NOTIFY", "yes") == "no":
+            return
+        i = self.info
+        title = " — ".join(x for x in (i.get("ALBUM_ARTIST", ""), i.get("ALBUM", "")) if x) or _("Аудіо-CD")
+        self.tray.notify(title, _("Відтворюю диск. Керувати ним можна зі значка в лотку або з системних елементів керування музикою."),
+                         i.get("COVER", ""), PLAY_HINT_MS)
 
     # --- дії меню ------------------------------------------------------------------------
     def build_actions(self):
@@ -1490,6 +1558,8 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.p_play.set_icon_name("media-playback-pause-symbolic" if playing else "media-playback-start-symbolic")
         self.now.set_text(self.now_text())
         self.now.set_tooltip_text(self.now_text())
+        self.tray.set_tooltip(self.now_text())
+        self.tray.refresh()
         self.show_player_cover()
         self.mark_playing()
         if self.mpris:
@@ -1844,6 +1914,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         self.poll_disc()
         self.enable("eject", self.last_tracks > 0)
+        self.tray.refresh()
         return GLib.SOURCE_CONTINUE
 
     # --- дії ------------------------------------------------------------------------------
@@ -1930,8 +2001,20 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             self.state.put("width", width)
             self.state.put("height", height)
 
+    def can_background(self):
+        """Лотка немає зовсім (GNOME без розширення), але музикою можна керувати через MPRIS."""
+        return super().can_background() and not self.tray.available()
+
     def on_close(self, _window):
         self.save_layout()
+        # з лотком закриття вікна лише ховає його: програвач грає далі
+        if not self.quitting and self.tray_enabled():
+            self.set_visible(False)
+            if not self.state.get("tray_hint", False):
+                self.state.put("tray_hint", True)
+                self.tray.notify("CD Auto Runner", _("CD Auto Runner працює далі в системному лотку. Щоб вийти, оберіть «Вийти» в меню його значка."),
+                                 "", TRAY_HINT_MS)
+            return True
         if not self.quitting and self.can_background():
             self.set_visible(False)
             self.backgrounded = True
@@ -1950,6 +2033,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             return
         self.shut_down = True
         playing = self.cur is not None
+        self.tray.close()
         if self.mpv:
             self.mpv.quit()
         self.write_want(None)
@@ -1959,6 +2043,15 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         # без бібліотеки треки копіюються лише для цього вікна — далі копіювати нема сенсу
         if playing and read_config().get("LIBRARY", "yes") != "yes" and self.builtin_selected():
             run("stop", timeout=10)
+
+
+def icon_folder():
+    """Тека зі значком програми, якщо він не лежить у темі значків."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for folder in (here, os.path.normpath(os.path.join(here, "..", "desktop"))):     # запуск із репозиторію
+        if os.path.isfile(os.path.join(folder, f"{APP}.svg")):
+            return folder
+    return None
 
 
 class Application(Adw.Application):
@@ -1971,11 +2064,9 @@ class Application(Adw.Application):
         GLib.set_application_name("CD Auto Runner")
         Gtk.Window.set_default_icon_name(APP)
         display = Gdk.Display.get_default()
-        here = os.path.dirname(os.path.abspath(__file__))
         theme = Gtk.IconTheme.get_for_display(display)
-        for folder in (here, os.path.join(here, "..", "desktop")):     # запуск із репозиторію
-            if os.path.isfile(os.path.join(folder, f"{APP}.svg")):
-                theme.add_search_path(folder)
+        if icon_folder():
+            theme.add_search_path(icon_folder())
         css = Gtk.CssProvider()
         css.load_from_string(CSS)
         Gtk.StyleContext.add_provider_for_display(display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -1990,7 +2081,8 @@ class Application(Adw.Application):
             self.window = MainWindow(self, play=play)
         elif play:
             self.window.request_play()
-        self.window.show_window()
+        if not (play and self.window.play_in_tray()):
+            self.window.show_window()
         return 0
 
     def do_activate(self):

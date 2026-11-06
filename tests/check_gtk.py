@@ -7,6 +7,7 @@ Checks the GTK window on a temporary Broadway display in its own D-Bus session, 
 cd-auto-runner and real mpv playback (null audio). Skipped when GTK 4, libadwaita or
 gtk4-broadwayd is missing. Run: python3 tests/check_gtk.py
 """
+import atexit
 import importlib.util
 import os
 import re
@@ -27,6 +28,28 @@ case "$1" in
   eject) echo eject >> "$FAKE_LOG"; echo 0 > "$FAKE_TRACKS" ;;
   *) echo "$*" >> "$FAKE_LOG" ;;
 esac
+'''
+
+
+# Панель: приймає значки, як kded у KDE чи розширення AppIndicator у GNOME
+FAKE_PANEL = r'''
+import sys
+from gi.repository import Gio, GLib
+XML = """<node><interface name="org.kde.StatusNotifierWatcher">
+  <property name="IsStatusNotifierHostRegistered" type="b" access="read"/>
+  <method name="RegisterStatusNotifierItem"><arg direction="in" type="s"/></method>
+</interface></node>"""
+def call(_bus, _sender, _path, _iface, _method, args, invocation):
+    with open(sys.argv[1], "a") as f:
+        f.write(args.unpack()[0] + "\n")
+    invocation.return_value(None)
+def acquired(bus, _name):
+    print("ready", flush=True)
+bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+bus.register_object("/StatusNotifierWatcher", Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0], call,
+                    lambda *_a: GLib.Variant("b", True), None)
+Gio.bus_own_name_on_connection(bus, "org.kde.StatusNotifierWatcher", Gio.BusNameOwnerFlags.NONE, acquired, None)
+GLib.MainLoop().run()
 '''
 
 
@@ -179,6 +202,16 @@ def scenario(tmp):
 
     check_tagger(app, tmp, spin)
 
+    # без панелі лотка немає; з'явилась — значок реєструється сам
+    assert not win.tray_enabled(), "панелі ще немає"
+    panel = fake_panel(tmp)
+    item = TrayClient(spin, win.tray.service)
+    assert spin(3, lambda: win.tray.service in panel.registered()), "значок зареєстровано"
+    assert win.tray_enabled()
+    check_tray(win, item, spin, album, tmp)
+    panel.stop()
+    assert spin(3, lambda: not win.tray.available()), "панель зникла"
+
     # закриття під час відтворення лише ховає вікно
     win.show_tile(album)
     win.on_play()
@@ -187,7 +220,143 @@ def scenario(tmp):
         win.close()
         assert spin(1, lambda: not win.get_visible()) and win.backgrounded, "сховано"
         assert spin(8, lambda: win.shut_down), "вихід, коли музика скінчилась"
+
+    # вікно, якого не показували (диск грає в лотку): «Вийти» з меню завершує програму
+    panel = fake_panel(tmp)
+    win = g.MainWindow(app)
+    app.window = win
+    assert spin(3, lambda: win.tray.service in panel.registered()), "значок нового вікна"
+    win.state.put("play_in_tray", True)
+    assert win.play_in_tray()
+    win.state.put("play_in_tray", False)
+    assert not win.get_realized()
+    item.click(win, "Quit")
+    assert spin(3, lambda: win.shut_down), "вихід із лотка"
+    assert spin(3, lambda: not item.owned()), "значок прибрано"
+    panel.stop()
     print("вікно GTK: гаразд / GTK window: ok")
+
+
+class Panel:
+    def __init__(self, process, log):
+        self.process, self.log = process, log
+
+    def registered(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log) as f:
+            return f.read().split()
+
+    def stop(self):
+        self.process.terminate()
+        self.process.wait()
+
+
+def fake_panel(tmp):
+    log = f"{tmp}/panel"
+    if os.path.exists(log):
+        os.remove(log)
+    process = subprocess.Popen([sys.executable, "-c", FAKE_PANEL, log], stdout=subprocess.PIPE, text=True)
+    atexit.register(process.terminate)      # тест упав — панель не лишається тримати його вивід
+    assert process.stdout.readline().strip() == "ready"
+    return Panel(process, log)
+
+
+class TrayClient:
+    """Те, що робить панель: читає значок і меню, клацає."""
+
+    def __init__(self, spin, service):
+        from gi.repository import Gio, GLib
+        self.Gio, self.GLib, self.spin, self.service = Gio, GLib, spin, service
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+
+    def call(self, path, iface, method, signature=None, *args):
+        results = []
+        params = self.GLib.Variant(f"({signature})", args) if signature else None
+        self.bus.call(self.service, path, iface, method, params, None, self.Gio.DBusCallFlags.NONE, 3000, None,
+                      lambda bus, res: results.append(bus.call_finish(res).unpack()))
+        assert self.spin(4, lambda: results), method
+        return results[0]
+
+    def owned(self):
+        results = []
+        self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner",
+                      self.GLib.Variant("(s)", (self.service,)), None, self.Gio.DBusCallFlags.NONE, 3000, None,
+                      lambda bus, res: results.append(bus.call_finish(res).unpack()[0]))
+        assert self.spin(4, lambda: results)
+        return results[0]
+
+    def prop(self, name):
+        return self.call("/StatusNotifierItem", "org.freedesktop.DBus.Properties", "Get", "ss",
+                         "org.kde.StatusNotifierItem", name)[0]
+
+    def activate(self, method):
+        self.call("/StatusNotifierItem", "org.kde.StatusNotifierItem", method, "ii", 0, 0)
+
+    def menu(self):
+        """Пункти меню: {напис: властивості}, роздільники під номерами."""
+        _revision, (_root, _props, children) = self.call("/MenuBar", "com.canonical.dbusmenu", "GetLayout",
+                                                         "iias", 0, -1, [])
+        return {props.get("label", number): dict(props, id=number) for number, props, _sub in children}
+
+    def click(self, win, label):
+        self.call("/MenuBar", "com.canonical.dbusmenu", "Event", "isvu", self.menu()[label]["id"], "clicked",
+                  self.GLib.Variant("s", ""), 0)
+
+
+def check_tray(win, item, spin, album, tmp):
+    """Значок поводиться, як у Qt: меню, кліки, згортання, вихід, вимкнення в налаштуваннях."""
+    assert item.prop("IconName") == win.tray.icon and item.prop("ItemIsMenu") is False
+    assert item.prop("Menu") == "/MenuBar" and item.prop("IconThemePath").endswith("desktop")
+    labels = [k for k in item.menu() if isinstance(k, str)]
+    assert labels == ["Show / hide the window", "Play / pause", "Previous track", "Next track", "Stop playback",
+                      "Eject the disc", "About", "Quit"], labels
+    assert sum(1 for p in item.menu().values() if p.get("type") == "separator") == 2
+
+    # стан пунктів і підказка йдуть за програвачем
+    assert item.call("/MenuBar", "com.canonical.dbusmenu", "AboutToShow", "i", 0) in ((False,), (True,))
+    assert item.menu()["Play / pause"]["enabled"] is win.p_play.get_sensitive()
+    win.show_tile(album)
+    win.on_play()
+    assert spin(5, lambda: win.length > 0)
+    assert item.menu()["Play / pause"]["enabled"] is True
+    assert "Song1" in item.prop("ToolTip")[3]
+
+    # клік ховає й показує вікно, середня кнопка — пауза
+    assert win.get_visible()
+    item.activate("Activate")
+    assert spin(2, lambda: not win.get_visible()), "сховано кліком"
+    item.activate("Activate")
+    assert spin(2, lambda: win.get_visible()), "показано кліком"
+    item.activate("SecondaryActivate")
+    assert spin(2, lambda: win.is_paused), "пауза середньою кнопкою"
+    item.activate("SecondaryActivate")
+    assert spin(2, lambda: not win.is_paused)
+
+    # закрите вікно: програма працює далі й не виходить, коли музика скінчилась
+    win.close()
+    assert spin(1, lambda: not win.get_visible()) and not win.backgrounded and win.state.get("tray_hint", False)
+    assert spin(8, lambda: win.cur is None), "кінець альбому"
+    spin(2.5)
+    assert not win.shut_down, "лишається в лотку"
+    item.click(win, "Show / hide the window")
+    assert spin(2, lambda: win.get_visible()), "показано з меню"
+
+    # недоступний пункт не спрацьовує
+    assert item.menu()["Eject the disc"]["enabled"] is False
+    item.click(win, "Eject the disc")
+    assert win.last_tracks == 0
+
+    # вимкнено в налаштуваннях: значка немає, закриття завершує програму (перевіряє головний сценарій)
+    win.show_preferences()
+    dialog = win.get_visible_dialog()
+    assert dialog.tray.get_sensitive() and dialog.tray.get_active() and dialog.quiet.get_sensitive()
+    dialog.tray.set_active(False)
+    assert spin(3, lambda: not item.owned()) and not win.tray_enabled() and not dialog.quiet.get_sensitive()
+    dialog.tray.set_active(True)
+    assert spin(3, lambda: item.owned()) and win.tray_enabled(), "значок повернувся"
+    dialog.close()
+    spin(0.5)
 
 
 def check_tagger(app, tmp, spin):

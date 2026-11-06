@@ -6,7 +6,7 @@
 # Copyright (C) 2026 Pan Vena
 set -uo pipefail
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 APP="cd-auto-runner"
 APP_TITLE="CD Auto Runner"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$APP"
