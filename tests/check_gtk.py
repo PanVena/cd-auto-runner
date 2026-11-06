@@ -188,6 +188,32 @@ def scenario(tmp):
     assert spin(5, lambda: win.queue.get("ALBUM_DIR") == second), "наступний альбом"
     assert win.title_label.get_text() == "Second", "показаний альбом іде за тим, що грає"
     win.stop_playback()
+
+    # лише один виконавець: черга з усієї бібліотеки, редагувати її нема чого
+    assert win.tile_artist(album) == "Band"
+    win.lookup_action("play-artist").activate(GLib.Variant("s", "Band"))
+    assert spin(5, lambda: win.cur == 1 and win.length > 0), "виконавець грає"
+    assert win.queue["ALBUM_DIR"] == core.ARTIST_KEY + "Band" and win.info is win.queue
+    assert len(win.rows) == 3 and not win.lookup_action("tag").get_enabled()
+    win.stop_playback()
+    win.open_tile(second)
+
+    # відкрити всі треки виконавця, не відтворюючи
+    win.lookup_action("open-artist").activate(GLib.Variant("s", "Band"))
+    assert win.cur is None and win.info["ALBUM_DIR"] == core.ARTIST_KEY + "Band" and len(win.rows) == 3
+    assert win.rows[0].get_subtitle() == "Record" and win.rows[2].get_subtitle() == "Second", "альбом треку"
+
+    # продовження: mpv справді стає на паузу на збереженій позиції
+    win.adopt()
+    win.play_track(1, start=0.4, paused=True)
+    win.open_tile(album)
+    win.show_queue()                    # клік на рядку «що грає»
+    assert win.info is win.queue and win.title_label.get_text() == win.queue["ALBUM"], "назад до списку"
+    assert spin(1, lambda: win.get_focus() is win.rows[0]), "до поточного треку"
+    assert spin(5, lambda: win.length > 0 and abs(win.pos - 0.4) < 0.1), "позиція після відкриття файла"
+    assert win.is_paused and spin(0.5) is False and abs(win.pos - 0.4) < 0.1, "на паузі не грає"
+    win.stop_playback()
+    win.open_tile(second)
     win.toggle_album_block(second)
     assert spin(3, lambda: second in win.block_grid.tiles and second not in win.lib_list.tiles), "плитка перейшла"
     badge = win.lib_stack.get_page(win.block_grid).get_badge_number()

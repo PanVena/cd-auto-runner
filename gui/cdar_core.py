@@ -240,6 +240,11 @@ EN = {
     "За назвою": "By title",
     "За датою додавання": "By date added",
     "За роком": "By year",
+    "Відтворити лише {artist}": "Play only {artist}",
+    "Усі треки": "All tracks",
+    "Усі треки: {artist}": "All tracks: {artist}",
+    "Альбом": "Album",
+    "Перейти до списку, що грає": "Go to the list that is playing",
 }
 
 
@@ -576,6 +581,18 @@ BLOCKED = ".Blacklist"
 BLOCKED_ALBUMS = ".Blacklist-albums"
 
 
+# ключ черги «усі треки виконавця»: шлях до файлу чи теки так не починається
+ARTIST_KEY = "artist:"
+
+
+# виконавець збірки (players/_lib.sh)
+VARIOUS = "Various Artists"
+
+
+# як часто запам'ятовувати позицію, поки грає: вимкнення комп'ютера не дає програмі завершитися
+RESUME_EVERY = 15
+
+
 # у кирилиці Unicode ставить ґ, є, і, ї після «я»; порядок української абетки — зразу за г, е, и
 COLLATE = str.maketrans({"ґ": "г\uffff", "є": "е\uffff", "і": "и\uffff", "ї": "и\uffff\uffff"})
 
@@ -823,6 +840,32 @@ def entry_key(info):
     return info.get("ALBUM_DIR") or info.get("DISC_ID")
 
 
+def is_artist(key):
+    return key.startswith(ARTIST_KEY)
+
+
+def has_artist(album, wanted):
+    return any(sort_key(t["artist"]) == wanted for t in album["tracks"])
+
+
+def read_artist(key, albums, root):
+    """Усі треки виконавця як альбом (read_album): у порядку бібліотеки, зі збірками. Ця черга
+    нікуди не записана й живе, поки грає або показана. LIBRARY_DIR порожній: теки в неї немає.
+    None — таких треків уже немає."""
+    name, wanted, tracks, cover = key[len(ARTIST_KEY):], sort_key(key[len(ARTIST_KEY):]), [], ""
+    for found in albums:
+        album = read_album(found["ALBUM_DIR"], root) if has_artist(found, wanted) else None
+        for t in album["tracks"] if album else ():
+            if sort_key(t["artist"]) == wanted:
+                pos = len(tracks) + 1
+                tracks.append({**t, "n": pos, "num": pos, "album": album["ALBUM"], "cover": album["COVER"]})
+                cover = cover or album["COVER"]
+    if not tracks:
+        return None
+    return {"ALBUM_DIR": key, "LIBRARY_DIR": "", "SOURCE": "artist", "COVER": cover, "ALBUM": _("Усі треки"),
+            "ALBUM_ARTIST": name, "YEAR": "", "tracks": tracks}
+
+
 def read_entry(key, root):
     """Плитка бібліотеки чи плейліста: альбом або None."""
     return read_playlist(key, root) if is_playlist(key) else read_album(key, root)
@@ -950,7 +993,7 @@ class Controller:
     Вікно дає: mpv, mpris; update_player, on_position, on_duration, show_disc, show_empty,
     show_loading, show_times, show_meta, fill_library, fill_tracks, update_states, update_service,
     action, rescan (перегляд бібліотеки), load_info (InfoWorker), load_times, current_track,
-    selected_tracks, select_tracks, toast, warn, start_detached, played_unseen, ui_get, ui_put."""
+    selected_tracks, select_tracks, reveal_track, toast, warn, start_detached, played_unseen, ui_get, ui_put."""
 
     def init_state(self, play=False):
         self.info = {}              # те, що показано: диск, альбом бібліотеки або плейліст
@@ -979,6 +1022,9 @@ class Controller:
         self.shuffle = self.ui_get("shuffle", "false") == "true"
         self.order = []             # порядок треків (перемішаний, якщо ввімкнено «Перемішувати»)
         self.pending_play = play    # відтворити, щойно прочитано диск
+        self.resume_wanted = not play   # повернутися до того, що грало перед виходом
+        self.scanned = False        # бібліотеку вже переглянуто
+        self.resume_saved = 0.0
         self.rip_started = 0.0
         self.titles_stamp = 0
         self.load_favorites()       # диск може заграти раніше, ніж закінчиться перегляд бібліотеки
@@ -1097,7 +1143,7 @@ class Controller:
         self.rip_started = time.monotonic()
         self.start_detached(self_bin(), ["play", "--player", "builtin", "--no-window", self.queue["DEVICE"]])
 
-    def play_track(self, n):
+    def play_track(self, n, start=0.0, paused=False):
         tracks = self.queue.get("tracks", [])
         if not self.mpv or not tracks or not 1 <= n <= len(tracks):
             return
@@ -1108,22 +1154,56 @@ class Controller:
             self.toast(_("Трек {n} у чорному списку.", n=n))
             return
         self.cur = n
-        self.pos = 0.0
+        self.pos = start
         path = self.track_file(n)
         if path:
             self.want = None
             self.write_want(None)
             self.length = 0.0
-            self.mpv.load(path)
+            self.mpv.load(path, start, paused)
         else:
             self.want = n
             self.mpv.stop()
             self.write_want(n)
             self.ensure_ripping()
-        self.is_paused = False
+        self.is_paused = paused
+        self.on_position(start)
+        self.save_resume()
         self.update_player()
 
+    def save_resume(self):
+        """Запам'ятовує трек, звідки він грає й позицію. Диск запам'ятовується альбомом у бібліотеці:
+        до нього можна повернутися, коли диска вже немає. Ще не скопійований трек не записується."""
+        link = self.track_link(self.cur, self.queue) if self.cur is not None else None
+        if link:
+            self.resume_saved = time.monotonic()
+            self.ui_put("resume", json.dumps({"key": self.queue.get("ALBUM_DIR") or self.queue["LIBRARY_DIR"],
+                                              "file": link[0], "pos": self.pos}))
+
+    def restore_session(self):
+        """Один раз після запуску: відкриває те, що грало, і ставить трек на паузу на тій самій
+        позиції. Вставлений диск і --play важливіші: тоді запам'ятоване лишається на потім.
+        Чекає на перегляд бібліотеки (треки виконавця) й перший опит приводу."""
+        if not self.resume_wanted or not self.scanned or self.last_tracks < 0 or self.loading:
+            return
+        self.resume_wanted = False
+        if not self.mpv or self.pending_play or self.disc.get("tracks") or self.cur is not None or self.album_open():
+            return
+        try:
+            saved = json.loads(self.ui_get("resume", "") or "{}")
+        except ValueError:
+            return
+        key = saved.get("key", "")
+        album = self.read_key(key) if key else None
+        track = next((t for t in album["tracks"] if os.path.normpath(t["path"]) == saved.get("file")
+                      and not t.get("missing")), None) if album else None
+        if track is None or self.track_blocked(track, album) or not self.open_album(key) or not self.plays_here():
+            return
+        self.adopt()
+        self.play_track(track["n"], start=float(saved.get("pos", 0)), paused=True)
+
     def stop_playback(self):
+        self.save_resume()
         if self.mpv:
             self.mpv.stop()
         self.cur = self.want = None
@@ -1185,7 +1265,8 @@ class Controller:
 
     def next_album(self):
         """Альбом, який заграє після поточного: наступний у порядку бібліотеки, лише без повтору.
-        Плейліст і вставлений диск закінчуються самі: вони не мають місця серед альбомів."""
+        Плейліст, усі треки виконавця й вставлений диск закінчуються самі: вони не мають місця
+        серед альбомів."""
         key = self.queue.get("ALBUM_DIR")
         if self.cur is None or self.loop != "None" or not key or self.queue.get("PLAYLIST"):
             return None
@@ -1291,6 +1372,7 @@ class Controller:
 
     def on_paused(self, paused):
         self.is_paused = paused
+        self.save_resume()
         self.update_player()
 
     def on_ended(self, reason):
@@ -1300,6 +1382,7 @@ class Controller:
                 self.play_track(n)
             elif not self.play_next_album():
                 self.stop_playback()
+                self.ui_put("resume", "")   # дослухано до кінця: повертатися нема куди
         elif reason == "error" and self.cur is not None:
             self.toast(_("Не вдалося відтворити трек {n}.", n=self.cur))
             self.stop_playback()
@@ -1314,7 +1397,7 @@ class Controller:
         """Показує альбом або плейліст замість диска; диск лишається в приводі й копіюється далі,
         а те, що грає, грає далі. Альбом, який грає, відкривається тим самим об'єктом."""
         playing = self.cur is not None and self.queue.get("ALBUM_DIR") == folder
-        album = self.queue if playing else read_entry(folder, self.library_root())
+        album = self.queue if playing else self.read_key(folder)
         if not album:
             self.toast(_("Не вдалося відкрити альбом."))
             self.rescan()
@@ -1384,7 +1467,7 @@ class Controller:
         if not shown and not queued:
             return
         old = self.queue if queued else self.info
-        fresh = read_entry(key, self.library_root())
+        fresh = self.read_key(key)
         if fresh:
             times = {t["path"]: t["sec"] for t in old["tracks"]}
             for t in fresh["tracks"]:
@@ -1415,6 +1498,7 @@ class Controller:
 
     def take_scan(self, albums, playlists, blocked):
         self.albums, self.playlists, self.blocked_list = sort_albums(albums, self.sort), playlists, blocked
+        self.scanned = True
         self.load_favorites()
 
     def set_sort(self, mode):
@@ -1426,9 +1510,9 @@ class Controller:
             self.update_player()        # наступний альбом тепер інший
 
     def by_album(self, file, info):
-        """Трек заблокований разом з альбомом. Це діє лише в плейлісті: сам альбом можна
-        відтворити вручну, а вставлений диск — це не бібліотека."""
-        return bool(info.get("PLAYLIST")) and os.path.dirname(file) in self.blocked_albums
+        """Трек заблокований разом з альбомом. Це діє лише в плейлісті й у треках виконавця:
+        сам альбом можна відтворити вручну, а вставлений диск — це не бібліотека."""
+        return info.get("SOURCE") in ("playlist", "artist") and os.path.dirname(file) in self.blocked_albums
 
     def file_blocked(self, file, info):
         return file in self.blocked or self.by_album(file, info)
@@ -1592,6 +1676,43 @@ class Controller:
         chosen = set(self.selected_tracks())
         self.save_order([t for t in self.info["tracks"] if t["n"] not in chosen])
 
+    def read_key(self, key):
+        """Те, що відкривають за ключем: альбом, плейліст або всі треки виконавця."""
+        if is_artist(key):
+            return read_artist(key, self.albums, self.library_root())
+        return read_entry(key, self.library_root())
+
+    def can_edit(self):
+        """Назви можна редагувати в альбомі й на диску; у виконавця немає власної теки й мітки."""
+        return not self.playlist_open() and not is_artist(self.info.get("ALBUM_DIR", ""))
+
+    def solo_artist(self, name, folder):
+        """name, якщо є сенс грати лише його: він є ще десь, крім folder. Збірка — не виконавець."""
+        wanted = sort_key(name)
+        if not wanted or wanted == sort_key(VARIOUS):
+            return ""
+        return name if any(a["ALBUM_DIR"] != folder and not self.album_blocked(a["ALBUM_DIR"]) and has_artist(a, wanted)
+                           for a in self.albums) else ""
+
+    def tile_artist(self, key):
+        album = next((a for a in self.albums if a["ALBUM_DIR"] == key), {})
+        return self.solo_artist(album.get("ALBUM_ARTIST", ""), key)
+
+    def track_artist(self, chosen):
+        """Виконавець єдиного виділеного треку: для збірки це єдиний шлях до нього."""
+        key = self.info.get("ALBUM_DIR", "")
+        if len(chosen) != 1 or is_artist(key):
+            return ""
+        return self.solo_artist((self.track_title(chosen[0], self.info) or {}).get("artist", ""), key)
+
+    def play_artist(self, name):
+        self.play_tile(ARTIST_KEY + name)
+
+    def show_queue(self):
+        """Клік на рядку «що грає»: назад до списку, де грає трек, і до самого треку."""
+        if self.cur is not None and self.show_tile(self.queue.get("ALBUM_DIR", "")):
+            self.reveal_track(self.cur)
+
     def is_favorites_open(self):
         return self.playlist_open() == favorites_path(self.library_root())
 
@@ -1722,6 +1843,8 @@ class Controller:
         text = f"{t.get('num', self.cur):02d}. {t.get('title', '')}"
         if t.get("artist") and t.get("artist") != self.queue.get("ALBUM_ARTIST"):
             text += f" — {t['artist']}"
+        if t.get("album"):
+            text += f"  ·  {t['album']}"
         if self.is_paused:
             text += f"  ({_('Пауза')})"
         return text
@@ -1730,6 +1853,7 @@ class Controller:
         src = self.info.get("SOURCE", "none")
         labels = {"musicbrainz": "Назви з MusicBrainz", "cdtext": "Назви з диска (CD-TEXT)",
                   "mbsearch": "MusicBrainz (за назвою)", "library": "З бібліотеки", "playlist": "Плейліст",
+                  "artist": "Виконавець",
                   "ripped": "Записано з диска", "digital": "Цифровий альбом",
                   "user": "Назви введено вручну", "kde": "Кеш KDE", "none": "Диска немає в базах"}
         return _(labels.get(src, src))
@@ -1810,6 +1934,8 @@ class Controller:
 
     def poll_disc(self):
         """Періодична перевірка: вставлений чи вийнятий диск, нові назви, стан копіювання."""
+        if self.cur is not None and not self.is_paused and time.monotonic() - self.resume_saved >= RESUME_EVERY:
+            self.save_resume()
         # назви змінили не з вікна (сповіщення «Ввести назви…», термінал) — оновити
         if self.disc and not self.loading and self.titles_mtime() != self.titles_stamp:
             self.reload_info()
@@ -1836,3 +1962,4 @@ class Controller:
                 self.play_track(self.want)
             else:
                 self.ensure_ripping()
+        self.restore_session()

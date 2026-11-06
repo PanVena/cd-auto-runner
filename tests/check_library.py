@@ -115,8 +115,9 @@ class Player(core.Controller):
         def __init__(self):
             self.played = []
 
-        def load(self, path):
+        def load(self, path, start=0.0, paused=False):
             self.played.append(os.path.basename(path))
+            self.start = (start, paused)
 
         def stop(self):
             pass
@@ -157,6 +158,9 @@ class Player(core.Controller):
 
     update_player = show_disc = update_states = fill_library = fill_tracks = load_times = nothing
     select_tracks = write_want = nothing
+
+    def reveal_track(self, n):
+        self.revealed = n
 
 
 def end_track(player):
@@ -310,6 +314,161 @@ def check_player(root):
     assert core.read_m3u(core.blocked_path(root)) == [] and not player.blocked
 
 
+def check_artist(root):
+    """Лише один виконавець: черга з усієї бібліотеки, разом зі збірками, і далі нічого не грає."""
+    def album(artist, name, *tracks):
+        folder = os.path.join(root, artist, name)
+        touch(folder, *tracks)
+        return folder
+    first = album("ABBA", "Arrival", "01 - dum.flac", "02 - money.flac")
+    second = album("ABBA", "Voulez", "01 - chiquitita.flac")
+    other = album("Queen", "Jazz", "01 - bicycle.flac")
+    only = album("Solo", "Single", "01 - one.flac")
+    mix = album("Various Artists", "Mix", "01 - a.flac", "02 - b.flac")
+    core.write_marker(mix, {"ALBUM": "Mix", "ALBUM_ARTIST": "Various Artists"},
+                      [(1, "01 - a.flac", "abba", "Waterloo"), (2, "02 - b.flac", "Queen", "Radio")])
+    player = Player(root)
+    player.set_sort("title")
+
+    assert player.tile_artist(first) == "ABBA", "є інший альбом"
+    assert player.tile_artist(only) == "", "єдиний альбом — це просто «Відтворити»"
+    assert player.tile_artist(mix) == "", "збірка — не виконавець"
+    assert player.open_album(mix)
+    assert player.track_artist([1]) == "abba" and player.track_artist([1, 2]) == ""
+
+    key = core.ARTIST_KEY + "ABBA"
+    assert player.open_album(key)
+    assert player.info["ALBUM_ARTIST"] == "ABBA" and player.badge_text() == "Виконавець"
+    assert [t["title"] for t in player.info["tracks"]] == ["dum", "money", "Waterloo", "chiquitita"]
+    assert [t["n"] for t in player.info["tracks"]] == [1, 2, 3, 4]
+    assert player.info["tracks"][2]["album"] == "Mix", "альбом видно в MPRIS"
+    assert not player.playlist_open() and not player.can_edit(), "не можна ні редагувати, ні переставляти"
+    assert player.album_open() and player.plays_here(), "грає тут, як альбом"
+    assert player.track_artist([1]) == "", "усередині черги пункт не потрібен"
+
+    # кінець черги — зупинка, а не сусідній альбом
+    player.adopt()
+    player.play_track(player.first_track())
+    assert [end_track(player) for _i in range(3)] == ["02 - money.flac", "01 - a.flac", "01 - chiquitita.flac"]
+    assert end_track(player) is None and player.cur is None
+
+    # перемішування охоплює всю чергу
+    player.set_shuffle(True)
+    player.play_track(player.first_track())
+    assert sorted(player.play_order()) == [1, 2, 3, 4]
+    player.set_shuffle(False)
+
+    # чорний список: альбом зникає з черги на ходу, поточний трек поступається наступному
+    player.start_track(1)
+    player.toggle_album_block(first)
+    assert player.playable(player.queue) == [3, 4] and player.mpv.played[-1] == "01 - a.flac"
+    player.toggle_album_block(first)
+    player.stop_playback()
+
+    # змінені назви видно після перечитування, зайвий виконавець — це порожня черга
+    core.write_marker(second, {"ALBUM": "Voulez", "ALBUM_ARTIST": "ABBA"}, [(1, "01 - chiquitita.flac", "", "Chiquitita")])
+    player.reload_entry(key)
+    assert player.info["tracks"][3]["title"] == "Chiquitita"
+    assert not player.open_album(core.ARTIST_KEY + "Nobody"), "таких треків немає"
+    assert other in [a["ALBUM_DIR"] for a in player.albums]
+
+
+def check_resume(root):
+    """Трек, звідки він грав, і позиція — після нового запуску; вікна тут ті самі об'єкти Controller."""
+    a = os.path.join(root, "Band", "A")
+    b = os.path.join(root, "Band", "B")
+    touch(a, "01 - one.flac", "02 - two.flac")
+    touch(b, "01 - three.flac")
+
+    def restarted(store, last_tracks=0, play=False):
+        player = Player(root)
+        player.store = store
+        player.pending_play = play
+        player.resume_wanted = not play
+        player.last_tracks = last_tracks
+        player.restore_session()
+        return player
+
+    # альбом: той самий трек на паузі, на тій самій позиції
+    player = Player(root)
+    assert player.open_album(a)
+    player.adopt()
+    player.play_track(2)
+    player.pos = 42.5
+    player.save_resume()
+    store = player.store
+    again = restarted(store)
+    assert again.info["ALBUM_DIR"] == a and again.queue is again.info and again.cur == 2
+    assert again.is_paused and again.mpv.start == (42.5, True) and again.mpv.played == ["02 - two.flac"]
+
+    # черга виконавця повертається чергою, а не альбомом
+    key = core.ARTIST_KEY + "Band"
+    assert player.open_album(key)
+    player.adopt()
+    player.play_track(3)
+    player.stop_playback()              # «Стоп» не забуває, де зупинились
+    again = restarted(store)
+    assert again.queue["ALBUM_DIR"] == key and again.cur == 3 and again.mpv.played == ["01 - three.flac"]
+
+    # диск і --play важливіші, але запам'ятоване лишається
+    disc = restarted(dict(store), play=True)
+    assert disc.cur is None and disc.store["resume"]
+    busy = Player(root)
+    busy.store, busy.disc, busy.last_tracks = dict(store), {"tracks": [{}]}, 3
+    busy.restore_session()
+    assert busy.cur is None and not busy.album_open()
+
+    # файла вже немає — тихо нічого
+    gone = dict(store, resume='{"key": "' + a + '", "file": "' + a + '/nope.flac", "pos": 1}')
+    assert restarted(gone).cur is None and restarted({"resume": "зіпсовано"}).cur is None
+
+    # дослухали до кінця — повертатися нема куди
+    player.open_album(key)
+    player.adopt()
+    player.play_track(3)
+    assert end_track(player) is None and not player.store["resume"]
+
+
+def check_show_queue(root):
+    """Назад до списку, що грає: альбом, виконавець, диск; те, що грає, не переривається."""
+    a = os.path.join(root, "Band", "A")
+    b = os.path.join(root, "Band", "B")
+    touch(a, "01 - one.flac", "02 - two.flac")
+    touch(b, "01 - three.flac")
+    player = Player(root)
+    player.revealed = None
+    player.show_queue()
+    assert player.revealed is None, "нічого не грає — нікуди повертатися"
+
+    assert player.open_album(a)
+    player.adopt()
+    player.play_track(2)
+    assert player.open_album(b) and not player.showing_queue()
+    played = len(player.mpv.played)
+    player.show_queue()
+    assert player.info is player.queue and player.showing_queue() and player.revealed == 2
+    assert len(player.mpv.played) == played and player.cur == 2, "музика не переривається"
+    player.show_queue()                 # уже тут: лише прокрутка
+    assert player.info is player.queue
+
+    key = core.ARTIST_KEY + "Band"
+    assert player.open_album(key)
+    player.adopt()
+    player.play_track(3)
+    player.open_album(a)
+    player.show_queue()
+    assert player.info["ALBUM_DIR"] == key and player.revealed == 3
+
+    # диск: ключа альбому в нього немає
+    disc = {"DISC_ID": "x", "tracks": [{"n": 1, "title": "t", "artist": "", "path": os.path.join(a, "01 - one.flac")}]}
+    player.stop_playback()
+    player.disc = player.info = player.queue = disc
+    player.cur = 1
+    player.open_album(b)
+    player.show_queue()
+    assert player.info is disc and player.revealed == 1
+
+
 def check_relink(root):
     """_cdar_relink_playlists: перейменований під час «Ввести назви» трек не губиться з плейлістів."""
     path = os.path.join(core.playlists_dir(root), "Relink" + core.PLAYLIST_EXT)
@@ -376,6 +535,9 @@ with tempfile.TemporaryDirectory() as tmp:
         check(library)
     check_sort()
     check_player(os.path.join(tmp, "Плеєр"))
+    check_artist(os.path.join(tmp, "Виконавці"))
+    check_resume(os.path.join(tmp, "Повернення"))
+    check_show_queue(os.path.join(tmp, "Назад"))
 gui = load("gui")
 check_mosaic()
 print("бібліотека: гаразд / library: ok")

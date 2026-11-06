@@ -50,8 +50,8 @@ except ImportError:
     QDBusConnection = None
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))     # запуск з -I: спільний модуль лежить поруч
 from cdar_core import (     # noqa: E402
-    ALBUM_SORTS, is_blocked_list,
-    APP, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
+    ALBUM_SORTS, is_artist, is_blocked_list,
+    APP, ARTIST_KEY, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
     album_from_tags, album_tags, connect_mpris, embedded_cover, favorites_path, fetch_cover, fmt_time, is_playlist,
     looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc, read_marker, run,
     runtime_dir, safe_name, script_version, self_bin, track_label, track_seconds, write_marker,
@@ -201,6 +201,7 @@ class Mpv(QObject):
         self.tries = 0
         self.volume = 100
         self.path = os.path.join(runtime_dir(), f"mpv-{os.getpid()}.sock")
+        self.start_at = 0.0
 
     @staticmethod
     def available():
@@ -287,6 +288,9 @@ class Mpv(QObject):
                     self.duration.emit(float(data or 0))
                 elif name == "pause":
                     self.paused.emit(bool(data))
+            elif ev == "file-loaded" and self.start_at:
+                self.seek(self.start_at)
+                self.start_at = 0.0
             elif ev == "end-file":
                 self.ended.emit(msg.get("reason", ""))
 
@@ -300,9 +304,15 @@ class Mpv(QObject):
         self.ended.emit("quit")
 
     # --- команди ---
-    def load(self, path):
+    def load(self, path, start=0.0, paused=False):
+        """start — позиція в секундах; перейти на неї можна, лише коли файл відкриється.
+        Пауза ставиться до відкриття, щоб під час запуску не прозвучало ні звуку."""
+        self.start_at = start
+        if paused:
+            self.command("set_property", "pause", True)
         self.command("loadfile", path, "replace")
-        self.command("set_property", "pause", False)
+        if not paused:
+            self.command("set_property", "pause", False)
 
     def toggle(self):
         self.command("cycle", "pause")
@@ -459,6 +469,14 @@ def rounded_pixmap(pix, size, radius=12):
     p.drawPixmap(0, 0, pix)
     p.end()
     return out
+
+
+class ClickLabel(QLabel):
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
 
 
 class TabBadge(QLabel):
@@ -1098,6 +1116,9 @@ class MainWindow(Controller, QMainWindow):
         sel = self.tree.currentItem()
         return self.tree.indexOfTopLevelItem(sel) + 1 if sel else None
 
+    def reveal_track(self, n):
+        self.tree.scrollToItem(self.tree.topLevelItem(n - 1), QAbstractItemView.PositionAtCenter)
+
     def select_tracks(self, numbers):
         for n in numbers:
             self.tree.topLevelItem(n - 1).setSelected(True)
@@ -1199,7 +1220,7 @@ class MainWindow(Controller, QMainWindow):
         self.tree.moved.connect(self.on_tracks_moved, Qt.QueuedConnection)
         self.tree.setAlternatingRowColors(True)
         self.tree.setFrameShape(QFrame.NoFrame)
-        self.tree.setHeaderLabels(["№", _("Виконавець"), _("Назва"), _("Час"), _("Стан")])
+        self.tree.setHeaderLabels(["№", _("Виконавець"), _("Назва"), _("Час"), _("Стан"), _("Альбом")])
         h = self.tree.header()
         h.setStretchLastSection(False)
         h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -1207,7 +1228,10 @@ class MainWindow(Controller, QMainWindow):
         h.setSectionResizeMode(2, QHeaderView.Stretch)
         h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(5, QHeaderView.Interactive)
+        h.moveSection(5, 3)             # одразу після назви; є лише там, де треки з різних альбомів
         self.tree.setColumnWidth(1, 180)
+        self.tree.setColumnWidth(5, 180)
         self.tree.itemDoubleClicked.connect(self.on_track_activated)
         lay.addWidget(self.tree)
         return box
@@ -1243,8 +1267,9 @@ class MainWindow(Controller, QMainWindow):
         for b in (self.p_shuffle, self.p_loop, self.p_fav):
             b.setCheckable(True)
         row.addSpacing(8)
-        self.now = QLabel()
+        self.now = ClickLabel()
         self.now.setTextFormat(Qt.PlainText)
+        self.now.clicked.connect(self.show_queue)
         self.now.setMinimumWidth(80)
         row.addWidget(self.now, 1)
         vol_icon = QLabel()
@@ -1336,6 +1361,8 @@ class MainWindow(Controller, QMainWindow):
         playing = self.cur is not None and self.want is None and not self.is_paused
         self.p_play.setIcon(icon("media-playback-pause" if playing else "media-playback-start"))
         self.now.setText(self.now_text())
+        self.now.setCursor(Qt.ArrowCursor if self.cur is None else Qt.PointingHandCursor)
+        self.now.setToolTip("" if self.cur is None else _("Перейти до списку, що грає"))
         self.mark_playing()
         if self.tray:
             self.tray.setToolTip(f"CD Auto Runner\n{self.now.text()}")
@@ -1702,6 +1729,13 @@ class MainWindow(Controller, QMainWindow):
                                  lambda: self.toggle_favorite(links))
             act.setEnabled(bool(links))
 
+    def add_artist_items(self, menu, artist):
+        if artist:
+            menu.addAction(icon("media-playback-start"), _("Відтворити лише {artist}", artist=artist),
+                           lambda: self.play_artist(artist))
+            menu.addAction(icon("document-open"), _("Усі треки: {artist}", artist=artist),
+                           lambda: self.show_tile(ARTIST_KEY + artist))
+
     def on_tracks_menu(self, pos):
         item = self.tree.itemAt(pos)
         if item is None:
@@ -1712,10 +1746,12 @@ class MainWindow(Controller, QMainWindow):
         links = [link for link in (self.track_link(n, self.info) for n in chosen) if link]
         menu = QMenu(self)
         menu.addAction(icon("media-playback-start"), _("Відтворити"), lambda: self.start_track(chosen[0]))
+        self.add_artist_items(menu, self.track_artist(chosen))
+        first = len(menu.actions())
         self.add_menu(menu, links)
         if not links:
             menu.setToolTipsVisible(True)
-            menu.actions()[1].setToolTip(_("Спершу дочекайтеся, поки трек скопіюється в бібліотеку."))
+            menu.actions()[first].setToolTip(_("Спершу дочекайтеся, поки трек скопіюється в бібліотеку."))
         block = menu.addAction(icon("dialog-cancel"), self.block_label(links), lambda: self.block_chosen(links))
         block.setEnabled(self.can_block(links))
         if self.playlist_open() and not self.is_blocked_open():
@@ -1739,6 +1775,7 @@ class MainWindow(Controller, QMainWindow):
             return
         menu.addAction(icon("media-playback-start"), _("Відтворити"), lambda: self.play_tile(key))
         menu.addAction(icon("document-open"), _("Відкрити"), lambda: self.show_tile(key))
+        self.add_artist_items(menu, self.tile_artist(key))
         if is_playlist(key):
             if os.path.basename(key) != FAVORITES + PLAYLIST_EXT:
                 menu.addAction(icon("edit-rename"), _("Перейменувати…"), lambda: self.rename_playlist(key))
@@ -2067,9 +2104,9 @@ class MainWindow(Controller, QMainWindow):
             b.setEnabled(enabled)
         for b in (self.btn_rip, self.act_mb):
             b.setEnabled(disc)
-        self.btn_tag.setEnabled(enabled and not self.playlist_open())
+        self.btn_tag.setEnabled(enabled and self.can_edit())
         self.btn_tag.setText(_("Редагувати альбом") if self.album_open() else _("Ввести назви"))
-        self.act_album.setEnabled(enabled)
+        self.act_album.setEnabled(enabled and bool(self.info.get("LIBRARY_DIR")))
 
     def set_cover(self, path="", image=None):
         pix = QPixmap(path) if path else QPixmap.fromImage(image) if image else QPixmap()
@@ -2131,9 +2168,11 @@ class MainWindow(Controller, QMainWindow):
         self.tree.setDragEnabled(reorder)
         self.tree.setDragDropMode(QAbstractItemView.InternalMove if reorder else QAbstractItemView.NoDragDrop)
         self.tree.setDropIndicatorShown(reorder)
+        self.tree.setColumnHidden(1, is_artist(self.info.get("ALBUM_DIR", "")))
+        self.tree.setColumnHidden(5, not any(t.get("album") for t in self.info.get("tracks", [])))
         for t in self.info.get("tracks", []):
             item = QTreeWidgetItem([f"{t.get('num', t['n']):02d}", t["artist"], t["title"],
-                                    fmt_time(t["sec"]) if t["sec"] else "", ""])
+                                    fmt_time(t["sec"]) if t["sec"] else "", "", t.get("album", "")])
             blocked = self.track_blocked(t, self.info)
             if t.get("missing"):
                 item.setText(4, _("файлу немає"))
@@ -2150,7 +2189,7 @@ class MainWindow(Controller, QMainWindow):
             item.setTextAlignment(0, Qt.AlignRight | Qt.AlignVCenter)
             item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
             if t["placeholder"] or blocked:
-                for c in (1, 2):
+                for c in (1, 2, 5):
                     item.setForeground(c, muted)
                     item.setFont(c, italic)
             self.tree.addTopLevelItem(item)
@@ -2261,6 +2300,7 @@ class MainWindow(Controller, QMainWindow):
         if self.shut_down:
             return
         self.shut_down = True
+        self.save_resume()
         if self.isVisible():
             self.save_layout()
         if self.tray:

@@ -40,7 +40,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, GObject, Graphene, Gsk
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))     # запуск з -I: спільний модуль лежить поруч
 from cdar_core import (     # noqa: E402
     ALBUM_SORTS, is_blocked_list,
-    APP, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
+    APP, ARTIST_KEY, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
     album_from_tags, album_tags, connect_mpris, embedded_cover, favorites_path, fetch_cover, fmt_time, is_playlist,
     looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc, read_marker, run,
     runtime_dir, safe_name, script_version, self_bin, track_label, track_seconds, write_marker,
@@ -155,6 +155,7 @@ class Mpv:
         self.tries = 0
         self.volume = 100
         self.path = os.path.join(runtime_dir(), f"mpv-{os.getpid()}.sock")
+        self.start_at = 0.0
         self.on_position = self.on_duration = self.on_paused = self.on_ended = self.on_failed = lambda *_a: None
 
     @staticmethod
@@ -250,6 +251,9 @@ class Mpv:
                     self.on_duration(float(value or 0))
                 elif name == "pause":
                     self.on_paused(bool(value))
+            elif ev == "file-loaded" and self.start_at:
+                self.seek(self.start_at)
+                self.start_at = 0.0
             elif ev == "end-file":
                 self.on_ended(msg.get("reason", ""))
         return GLib.SOURCE_CONTINUE
@@ -273,9 +277,15 @@ class Mpv:
             self.on_ended("quit")
 
     # --- команди ---
-    def load(self, path):
+    def load(self, path, start=0.0, paused=False):
+        """start — позиція в секундах; перейти на неї можна, лише коли файл відкриється.
+        Пауза ставиться до відкриття, щоб під час запуску не прозвучало ні звуку."""
+        self.start_at = start
+        if paused:
+            self.command("set_property", "pause", True)
         self.command("loadfile", path, "replace")
-        self.command("set_property", "pause", False)
+        if not paused:
+            self.command("set_property", "pause", False)
 
     def toggle(self):
         self.command("cycle", "pause")
@@ -989,7 +999,7 @@ class TrackRow(Adw.ActionRow):
     def __init__(self, track, album_artist, reorder):
         title = track["title"] or _("Трек {n}", n=track["n"])
         artist = track["artist"] if track["artist"] != album_artist else ""
-        super().__init__(title=title, subtitle=artist, use_markup=False, activatable=True, title_lines=1, subtitle_lines=1)
+        super().__init__(title=title, subtitle=" · ".join(filter(None, (artist, track.get("album")))), use_markup=False, activatable=True, title_lines=1, subtitle_lines=1)
         self.track = track
         self.stack = Gtk.Stack(hhomogeneous=True)
         self.number = label(f"{track.get('num', track['n']):02d}", ("dim-label", "track-number"), xalign=1.0)
@@ -1194,6 +1204,13 @@ class MainWindow(Controller, Adw.ApplicationWindow):
     def selected_tracks(self):
         return sorted(row.get_index() + 1 for row in self.tracks.get_selected_rows())
 
+    def reveal_track(self, n):
+        """Рядки щойно створені: фокус прокрутить до них лише після розміщення."""
+        self.split.set_show_content(True)
+        rows = self.rows
+        GLib.timeout_add(60, lambda: (n <= len(rows) and rows is self.rows and rows[n - 1].grab_focus(),
+                                      GLib.SOURCE_REMOVE)[1])
+
     def select_tracks(self, numbers):
         for n in numbers:
             self.tracks.select_row(self.rows[n - 1])
@@ -1286,7 +1303,8 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             "tile-cover": self.set_playlist_cover, "tile-cover-clear": self.remove_playlist_cover,
             "tile-delete": self.delete_playlist, "tile-edit": self.edit_album, "tile-folder": self.open_dir,
             "add-to": lambda path: self.add_to_playlist(path, self.menu_links),
-            "tile-block": self.toggle_album_block,
+            "tile-block": self.toggle_album_block, "play-artist": self.play_artist,
+            "open-artist": lambda name: self.open_tile(ARTIST_KEY + name),
         }
         for name, handler in keyed.items():
             act = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
@@ -1481,6 +1499,10 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.now.set_width_chars(6)
         start.append(self.p_cover)
         start.append(self.now)
+        self.p_now = start
+        click = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
+        click.connect("released", lambda *_a: self.show_queue())
+        start.add_controller(click)
 
         center = Gtk.Box(spacing=2)
         self.p_prev = icon_button("media-skip-backward-symbolic", _("Попередній трек"), lambda _b: self.prev_track())
@@ -1577,7 +1599,9 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         playing = self.cur is not None and self.want is None and not self.is_paused
         self.p_play.set_icon_name("media-playback-pause-symbolic" if playing else "media-playback-start-symbolic")
         self.now.set_text(self.now_text())
-        self.now.set_tooltip_text(self.now_text())
+        self.now.set_tooltip_text(self.now_text() if self.cur is None else
+                                  f"{self.now_text()}\n{_('Перейти до списку, що грає')}")
+        self.p_now.set_cursor_from_name(None if self.cur is None else "pointer")
         self.tray.set_tooltip(self.now_text())
         self.tray.refresh()
         self.show_player_cover()
@@ -1662,6 +1686,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         if not is_blocked_list(key):
             first.append_item(menu_item(_("Відтворити"), "win.tile-play", key))
         first.append_item(menu_item(_("Відкрити"), "win.tile-open", key))
+        self.add_artist_items(first, self.tile_artist(key))
         menu.append_section(None, first)
         if is_blocked_list(key):
             pass
@@ -1689,6 +1714,11 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             menu.append_section(None, more)
         point = tile.compute_point(self.lib_stack, Graphene.Point().init(x, y))
         popup_menu(self.tile_menu, menu, point[1].x, point[1].y)
+
+    def add_artist_items(self, section, artist):
+        if artist:
+            section.append_item(menu_item(_("Відтворити лише {artist}", artist=artist), "win.play-artist", artist))
+            section.append_item(menu_item(_("Усі треки: {artist}", artist=artist), "win.open-artist", artist))
 
     def add_menu(self, menu, links):
         """Підменю «Додати до плейліста» і дія улюбленого для цих треків."""
@@ -1719,6 +1749,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         menu = Gio.Menu()
         first = Gio.Menu()
         first.append(_("Відтворити"), "win.tracks-play")
+        self.add_artist_items(first, self.track_artist(chosen))
         menu.append_section(None, first)
         self.add_menu(menu, links)
         block = Gio.Menu()
@@ -1856,7 +1887,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
         self.enable("rip", disc)
         self.enable("add-disc", disc and bool(self.info.get("MB_URL")))
         self.enable("open-album", enabled and bool(self.info.get("LIBRARY_DIR")))
-        self.enable("tag", enabled and not self.playlist_open())
+        self.enable("tag", enabled and self.can_edit())
         self.enable("eject", self.last_tracks > 0)
         self.btn_tag.get_child().set_label(_("Редагувати альбом") if self.album_open() else _("Ввести назви"))
         self.btn_rip.set_visible(disc)
@@ -2068,6 +2099,7 @@ class MainWindow(Controller, Adw.ApplicationWindow):
             return
         self.shut_down = True
         playing = self.cur is not None
+        self.save_resume()
         self.tray.close()
         if self.mpv:
             self.mpv.quit()
