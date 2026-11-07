@@ -437,6 +437,8 @@ fi
 # Оновлюємо кеш меню KDE
 for k in kbuildsycoca6 kbuildsycoca5; do have $k && { $k >/dev/null 2>&1 || true; break; }; done || true
 have update-desktop-database && update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+# Plasma читає теки теми значків лише під час запуску: без сигналу значка в новій теці не буде до повторного входу
+have dbus-send && dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 >/dev/null 2>&1 || true
 
 # --------------------------------------------------------------------------
 step "$(_ 'Готово!')"
