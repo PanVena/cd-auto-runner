@@ -22,6 +22,7 @@ Copyright (C) 2026 Pan Vena
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -154,20 +155,59 @@ def heart_icon():
     return out
 
 
+def portal_setting(key):
+    if QDBusConnection is None:
+        return None
+    call = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                                         "org.freedesktop.portal.Settings", "ReadOne")
+    call.setArguments(["org.freedesktop.appearance", key])
+    reply = QDBusConnection.sessionBus().call(call, QDBus.Block, 300)
+    if reply.type() != QDBusMessage.ReplyMessage or not reply.arguments():
+        return None
+    value = reply.arguments()[0]
+    return value.variant() if isinstance(value, QDBusVariant) else value
+
+
 def portal_color_scheme():
     """Вибір користувача зі стандартного порталу: 1 темна, 2 світла, 0 — немає вибору.
     Працює незалежно від того, чи дійшла ця настройка до самого Qt."""
-    if QDBusConnection is None:
-        return 0
-    call = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
-                                         "org.freedesktop.portal.Settings", "ReadOne")
-    call.setArguments(["org.freedesktop.appearance", "color-scheme"])
-    reply = QDBusConnection.sessionBus().call(call, QDBus.Block, 300)
-    if reply.type() != QDBusMessage.ReplyMessage or not reply.arguments():
-        return 0
-    value = reply.arguments()[0]
-    value = value.variant() if isinstance(value, QDBusVariant) else value
+    value = portal_setting("color-scheme")
     return value if value in (1, 2) else 0
+
+
+def accent_from_portal_value(value):
+    if not isinstance(value, (tuple, list)) or len(value) != 3:
+        return None
+    if any(not isinstance(channel, (int, float)) or isinstance(channel, bool) or not 0 <= channel <= 1
+           for channel in value):
+        return None
+    return QColor.fromRgbF(*value).name()
+
+
+def portal_accent_color():
+    try:
+        reply = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.freedesktop.portal.Desktop",
+             "--object-path", "/org/freedesktop/portal/desktop", "--method",
+             "org.freedesktop.portal.Settings.ReadOne", "org.freedesktop.appearance", "accent-color"],
+            capture_output=True, text=True, timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if reply.returncode != 0:
+        return None
+    match = re.search(r"<\(\s*([^)]+)\s*\)>", reply.stdout)
+    if not match:
+        return None
+    try:
+        channels = tuple(float(channel.strip()) for channel in match.group(1).split(","))
+    except ValueError:
+        return None
+    return accent_from_portal_value(channels)
+
+
+def system_accent_color():
+    return kde_accent_color() or portal_accent_color()
 
 
 def follow_color_scheme(app):
@@ -184,8 +224,8 @@ def is_dark(pal):
     return pal.color(QPalette.Window).lightness() < 128
 
 
-def apply_kde_accent(palette):
-    if accent := kde_accent_color():
+def apply_system_accent(palette):
+    if accent := system_accent_color():
         palette.setColor(QPalette.All, QPalette.Highlight, QColor(accent))
     return palette
 
@@ -2346,7 +2386,7 @@ def main():
     play = "--play" in sys.argv[1:]
     app = QApplication(sys.argv[:1])
     scheme = follow_color_scheme(app)
-    app.setPalette(apply_kde_accent(app.palette()))
+    app.setPalette(apply_system_accent(app.palette()))
     if GNOME and app.font().pointSizeF() >= 11:     # 11 pt GNOME щільний у GTK, а не у віджетах Qt
         font = app.font()
         font.setPointSizeF(font.pointSizeF() - 1)

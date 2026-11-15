@@ -8,6 +8,7 @@ import importlib.util
 import os
 import subprocess
 import tempfile
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -60,7 +61,7 @@ def check_qt_accent(gui):
             os.environ["XDG_CONFIG_HOME"] = config
             with open(os.path.join(config, "kdeglobals"), "w", encoding="utf-8") as f:
                 f.write("[General]\nAccentColor=233, 61, 88\n")
-            palette = gui.apply_kde_accent(gui.QPalette())
+            palette = gui.apply_system_accent(gui.QPalette())
             assert palette.color(gui.QPalette.Highlight).name() == "#e93d58"
             qss = gui.accent_stylesheet("#e93d58")
             assert all(style in qss for style in ("QToolButton:checked", "QSlider::handle:horizontal",
@@ -74,6 +75,16 @@ def check_qt_accent(gui):
             os.environ.pop("XDG_CONFIG_HOME", None)
         else:
             os.environ["XDG_CONFIG_HOME"] = previous_config
+
+
+def check_portal_accent(gui):
+    assert gui.accent_from_portal_value((0.2, 0.4, 0.6)) == "#336699"
+    assert gui.accent_from_portal_value((1.1, 0.4, 0.6)) is None
+    assert gui.accent_from_portal_value((0.2, 0.4)) is None
+    with patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}), \
+            patch.object(gui, "portal_accent_color", return_value="#ed5b00"):
+        palette = gui.apply_system_accent(gui.QPalette())
+        assert palette.color(gui.QPalette.Highlight).name() == "#ed5b00"
 
 
 def check_digital_album(root):
@@ -589,5 +600,6 @@ with tempfile.TemporaryDirectory() as tmp:
     check_show_queue(os.path.join(tmp, "Назад"))
 gui = load("gui")
 check_qt_accent(gui)
+check_portal_accent(gui)
 check_mosaic()
 print("бібліотека: гаразд / library: ok")
