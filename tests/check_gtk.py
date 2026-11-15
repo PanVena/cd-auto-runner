@@ -85,10 +85,13 @@ def tone(path):
 
 def scenario(tmp):
     os.environ.update(XDG_CONFIG_HOME=f"{tmp}/cfg", XDG_CACHE_HOME=f"{tmp}/cache", HOME=tmp, MPV_HOME=f"{tmp}/mpv",
+                      XDG_CURRENT_DESKTOP="KDE",
                       CDAR_UI_LANG="en", CDAR_SELF=f"{tmp}/self",
                       FAKE_DISC=f"{tmp}/disc", FAKE_LOG=f"{tmp}/log", FAKE_TRACKS=f"{tmp}/tracks")
     os.makedirs(f"{tmp}/mpv")
     os.makedirs(f"{tmp}/cfg/cd-auto-runner")
+    with open(f"{tmp}/cfg/kdeglobals", "w", encoding="utf-8") as f:
+        f.write("[General]\nAccentColor=233, 61, 88\n")
     with open(f"{tmp}/mpv/mpv.conf", "w") as f:
         f.write("ao=null\n")
     lib = f"{tmp}/Music"
@@ -116,6 +119,9 @@ def scenario(tmp):
     spec = importlib.util.spec_from_file_location("gui_gtk", os.path.join(ROOT, "gui", "gui_gtk.py"))
     g = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(g)
+    assert g.kde_accent_color() == "#e93d58", "акцент KDE"
+    css = g.css_with_accent(g.kde_accent_color())
+    assert all(value in css for value in ("#e93d58", "row:selected", "button.suggested-action", "scale slider"))
     import cdar_core as core
     from gi.repository import GLib, GdkPixbuf, Gtk
 

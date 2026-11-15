@@ -10,6 +10,7 @@ settings, the library, playlists, MPRIS and the player logic (Controller).
 SPDX-License-Identifier: GPL-2.0-only
 Copyright (C) 2026 Pan Vena
 """
+import configparser
 import glob
 import json
 import os
@@ -32,6 +33,22 @@ APP = "cd-auto-runner"
 
 
 GNOME = "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":")
+
+
+def kde_accent_color():
+    """Accent color chosen in KDE System Settings, or None outside KDE / if unavailable."""
+    if "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":"):
+        return None
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    settings = configparser.ConfigParser(interpolation=None)
+    try:
+        settings.read(os.path.join(config_home, "kdeglobals"), encoding="utf-8")
+        components = [int(value.strip()) for value in settings.get("General", "AccentColor").split(",")]
+    except (configparser.Error, OSError, ValueError):
+        return None
+    if len(components) != 3 or any(not 0 <= value <= 255 for value in components):
+        return None
+    return "#{:02x}{:02x}{:02x}".format(*components)
 
 
 HOMEPAGE = "https://github.com/PanVena/cd-auto-runner"

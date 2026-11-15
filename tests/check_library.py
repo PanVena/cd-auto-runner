@@ -28,6 +28,54 @@ def touch(folder, *names):
         open(os.path.join(folder, name), "w").close()
 
 
+def check_kde_accent():
+    previous_desktop = os.environ.get("XDG_CURRENT_DESKTOP")
+    previous_config = os.environ.get("XDG_CONFIG_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as config:
+            os.environ["XDG_CURRENT_DESKTOP"] = "KDE"
+            os.environ["XDG_CONFIG_HOME"] = config
+            with open(os.path.join(config, "kdeglobals"), "w", encoding="utf-8") as f:
+                f.write("[General]\nAccentColor=233, 61, 88\n")
+            assert core.kde_accent_color() == "#e93d58"
+            os.environ["XDG_CURRENT_DESKTOP"] = "GNOME"
+            assert core.kde_accent_color() is None
+    finally:
+        if previous_desktop is None:
+            os.environ.pop("XDG_CURRENT_DESKTOP", None)
+        else:
+            os.environ["XDG_CURRENT_DESKTOP"] = previous_desktop
+        if previous_config is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = previous_config
+
+
+def check_qt_accent(gui):
+    previous_desktop = os.environ.get("XDG_CURRENT_DESKTOP")
+    previous_config = os.environ.get("XDG_CONFIG_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as config:
+            os.environ["XDG_CURRENT_DESKTOP"] = "KDE"
+            os.environ["XDG_CONFIG_HOME"] = config
+            with open(os.path.join(config, "kdeglobals"), "w", encoding="utf-8") as f:
+                f.write("[General]\nAccentColor=233, 61, 88\n")
+            palette = gui.apply_kde_accent(gui.QPalette())
+            assert palette.color(gui.QPalette.Highlight).name() == "#e93d58"
+            qss = gui.accent_stylesheet("#e93d58")
+            assert all(style in qss for style in ("QToolButton:checked", "QSlider::handle:horizontal",
+                                                  "QProgressBar::chunk", "#e93d58"))
+    finally:
+        if previous_desktop is None:
+            os.environ.pop("XDG_CURRENT_DESKTOP", None)
+        else:
+            os.environ["XDG_CURRENT_DESKTOP"] = previous_desktop
+        if previous_config is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = previous_config
+
+
 def check_digital_album(root):
     folder = os.path.join(root, "Artist", "Digital")
     touch(folder, "b side.m4a", "a side.m4a", "cover.txt")
@@ -531,6 +579,7 @@ def check_mosaic():
 
 with tempfile.TemporaryDirectory() as tmp:
     library = os.path.join(tmp, "Музика")
+    check_kde_accent()
     for check in (check_digital_album, check_ripped_album, check_playlist, check_relink):
         check(library)
     check_sort()
@@ -539,5 +588,6 @@ with tempfile.TemporaryDirectory() as tmp:
     check_resume(os.path.join(tmp, "Повернення"))
     check_show_queue(os.path.join(tmp, "Назад"))
 gui = load("gui")
+check_qt_accent(gui)
 check_mosaic()
 print("бібліотека: гаразд / library: ok")

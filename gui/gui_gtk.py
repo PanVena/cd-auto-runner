@@ -42,7 +42,8 @@ from cdar_core import (     # noqa: E402
     ALBUM_SORTS, is_blocked_list,
     APP, ARTIST_KEY, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
     album_from_tags, album_tags, connect_mpris, embedded_cover, favorites_path, fetch_cover, fmt_time, is_playlist,
-    looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc, read_marker, run,
+    kde_accent_color, looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc,
+    read_marker, run,
     runtime_dir, safe_name, script_version, self_bin, track_label, track_seconds, write_marker,
 )
 from cdar_tray import Tray  # noqa: E402
@@ -77,10 +78,24 @@ CSS = """
 .badge.warning { background: alpha(@warning_bg_color, .22); color: @warning_color; }
 row.drop-above { box-shadow: inset 0 2px 0 0 @accent_bg_color; }
 row.drop-below { box-shadow: inset 0 -2px 0 0 @accent_bg_color; }
+row:selected { background-color: @accent_bg_color; color: white; }
+row:selected label { color: white; }
 row.playing { font-weight: 700; }
+button.suggested-action,
+button.suggested-action:hover,
+button.suggested-action:active,
+button.suggested-action:checked { background-color: @accent_bg_color; color: white; }
+scale highlight,
+scale slider { background-color: @accent_bg_color; border-color: @accent_bg_color; }
 .player { padding: 6px 12px 8px 12px; }
 .track-number { font-feature-settings: "tnum"; }
 """
+
+
+def css_with_accent(accent):
+    if not accent:
+        return CSS
+    return CSS.replace("@accent_bg_color", accent).replace("@accent_color", accent)
 
 
 def background(fn, *args, done=None):
@@ -2135,7 +2150,7 @@ class Application(Adw.Application):
         if icon_folder():
             theme.add_search_path(icon_folder())
         css = Gtk.CssProvider()
-        css.load_from_string(CSS)
+        css.load_from_string(css_with_accent(kde_accent_color()))
         Gtk.StyleContext.add_provider_for_display(display, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         for action, keys in (("win.quit", ["<Primary>q"]), ("win.preferences", ["<Primary>comma"]), ("win.refresh", ["F5"]),
                              ("win.play-pause", ["<Primary>space"]), ("win.next", ["<Alt>Right"]),

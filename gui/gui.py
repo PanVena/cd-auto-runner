@@ -53,6 +53,7 @@ from cdar_core import (     # noqa: E402
     ALBUM_SORTS, is_artist, is_blocked_list,
     APP, ARTIST_KEY, FAVORITES, GNOME, HOMEPAGE, LANG, LOOP_MODES, PLAYLIST_EXT, THUMB, TRACK_KEY, Controller, ThumbCache, _,
     album_from_tags, album_tags, connect_mpris, embedded_cover, favorites_path, fetch_cover, fmt_time, is_playlist,
+    kde_accent_color,
     looks_same, musicbrainz, playlist_name, playlists_dir, read_album, read_config, read_disc, read_marker, run,
     runtime_dir, safe_name, script_version, self_bin, track_label, track_seconds, write_marker,
 )
@@ -181,6 +182,28 @@ def follow_color_scheme(app):
 
 def is_dark(pal):
     return pal.color(QPalette.Window).lightness() < 128
+
+
+def apply_kde_accent(palette):
+    if accent := kde_accent_color():
+        palette.setColor(QPalette.All, QPalette.Highlight, QColor(accent))
+    return palette
+
+
+def accent_stylesheet(color):
+    accent = QColor(color)
+    return f"""
+        QToolButton:checked {{ background: {accent.name()}; border-radius: 6px; }}
+        QToolButton#libtab:checked {{
+            background: rgba({accent.red()},{accent.green()},{accent.blue()},36); color: {accent.name()};
+        }}
+        QSlider::groove:horizontal {{ height: 4px; background: palette(mid); border-radius: 2px; }}
+        QSlider::sub-page:horizontal {{ background: {accent.name()}; border-radius: 2px; }}
+        QSlider::handle:horizontal {{
+            width: 12px; height: 12px; margin: -5px 0; border-radius: 6px; background: {accent.name()};
+        }}
+        QProgressBar::chunk {{ background: {accent.name()}; }}
+    """
 
 
 # --- рушій вбудованого програвача: mpv у фоні, керування через JSON IPC --------------
@@ -1022,6 +1045,7 @@ class MainWindow(Controller, QMainWindow):
             QToolButton#libtab:hover {{ background: palette(alternate-base); }}
             QToolButton#libtab:checked {{ background: palette(midlight); }}
             QSplitter::handle {{ background: transparent; }}
+            {accent_stylesheet(hl.name())}
         """)
 
         root = QWidget()
@@ -2322,6 +2346,7 @@ def main():
     play = "--play" in sys.argv[1:]
     app = QApplication(sys.argv[:1])
     scheme = follow_color_scheme(app)
+    app.setPalette(apply_kde_accent(app.palette()))
     if GNOME and app.font().pointSizeF() >= 11:     # 11 pt GNOME щільний у GTK, а не у віджетах Qt
         font = app.font()
         font.setPointSizeF(font.pointSizeF() - 1)
